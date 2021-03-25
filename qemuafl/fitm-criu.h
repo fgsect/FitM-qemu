@@ -15,8 +15,6 @@
 
 #include "fitm.h"
 
-
-
 #define SNAP_SUCCESS_EXIT 42
 #define MAX_MSG_SIZE 1024
 
@@ -25,7 +23,7 @@
 #define FRKSRV_WRITE_FD            (199)
 
 
-char* get_new_uuid(void);
+//char* get_new_uuid(void);
 int do_criu(void);
 char* concat3(char *first, char *second, char *third);
 FILE *fitm_open_input_file(char *input);
@@ -70,21 +68,17 @@ void create_pipes_file(void) {
 void spawn_forksrv(CPUState *cpu, bool timewarp_mode) {
     if (!timewarp_mode) {
         char* shm_env_var = getenv_from_file(SHM_ENV_VAR);
-        char* afl_inst_ratio = getenv_from_file("AFL_INST_RATIO");
 
         if (shm_env_var) {
-            afl_setup(shm_env_var, afl_inst_ratio);
-            afl_forkserver(cpu, getenv_from_file(SHM_FUZZ_ENV_VAR));
+            afl_setup();
+            //afl_sharedmem_fuzzing = 1;
+            // TODO: AFL_QEMU_PERSISTENT_RET
+            afl_forkserver(cpu);
         } else {
             puts("AFL Forkserver not started, (SHM_ENV_VAR env var not set)");
         }
     }
 }
-
-/* AFL++ Sharedmap Fuzzing */
-extern int sharedmem_fuzzing;
-extern u32 *shared_buf_len;
-extern char *shared_buf;
 
 FILE *fitm_open_input_file(char *input) {
     // We want to get input from files so we pipe the file we get from AFL through an environment var into here.
@@ -191,6 +185,7 @@ exit:
     _exit(exitcode);
 }
 
+/*
 char* get_new_uuid(void){
     // Taken from: https://stackoverflow.com/questions/51053568/generating-a-random-uuid-in-c
     uuid_t binuuid;
@@ -200,6 +195,7 @@ char* get_new_uuid(void){
     uuid_unparse_lower(binuuid, uuid);
     return uuid;
 }
+*/
 
 char* concat3(char *first, char *second, char *third){
     size_t new_max_len = strlen(first) + strlen(second) + strlen(third) + 4;

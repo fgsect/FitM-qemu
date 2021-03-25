@@ -138,7 +138,7 @@
 #include "qemuafl/qasan-qemu.h"
 
 #ifndef NO_FITM
-// fitm specific hearders
+// fitm specific headers
 #include <sys/select.h>
 #include <sys/stat.h>
 #include "qemuafl/fitm-criu.h"
@@ -205,8 +205,6 @@ int init_recv_skip = 0;
 #else
 #define FDBG(...)
 #endif
-
-extern unsigned int afl_forksrv_pid;
 
 #endif /* NO_FITM */
 
@@ -2311,7 +2309,7 @@ static abi_long do_setsockopt(int sockfd, int level, int optname,
 
     if (sockfd == FITM_FD) {
         FDBG("Do_setsockopt returning 0");
-        return 0
+        return 0;
     }
 
 
@@ -3889,9 +3887,13 @@ static void fitm_ensure_initialized(void) {
 
         if (create_outputs) {
             // Open FD for writing. :)
-            char *uuid = get_new_uuid();
-            char path[44] = "./fd/";
-            strncat(path, uuid, 37);
+            struct timeval tv = {0};
+            gettimeofday(&tv, NULL);
+            long time_millis = (long) ((tv.tv_sec) * 1000 + (tv.tv_usec) / 1000);
+            //char *uuid = get_new_uuid();
+            char path[44] = {0};
+            snprintf(path, sizeof(path), "./fd/%ld", time_millis);
+            //strncat(path, uuid, 37);
             int new_fd = open(path, O_RDWR | O_CREAT, 0666);
             if (new_fd == -1) {
                 perror("do_socket(): Error while opening path ./fd/ in do_socket()");
@@ -4101,7 +4103,7 @@ static abi_long fitm_read(CPUState *cpu, int fd, char *msg, size_t len) {
 
 
 /* do_recvfrom() Must return target values and target errnos. */
-static abi_long do_recvfrom(int fd, abi_ulong msg, size_t len, int flags,
+static abi_long do_recvfrom(CPUState *cpu, int fd, abi_ulong msg, size_t len, int flags,
                             abi_ulong target_addr,
                             abi_ulong target_addrlen)
 {
@@ -4168,7 +4170,7 @@ fail:
 
 #ifdef TARGET_NR_socketcall
 /* do_socketcall() must return target values and target errnos. */
-static abi_long do_socketcall(int num, abi_ulong vptr)
+static abi_long do_socketcall(CPUState *cpu, int num, abi_ulong vptr)
 {
     static const unsigned nargs[] = { /* number of arguments per operation */
         [TARGET_SYS_SOCKET] = 3,      /* domain, type, protocol */
@@ -4231,11 +4233,11 @@ static abi_long do_socketcall(int num, abi_ulong vptr)
     case TARGET_SYS_SEND: /* sockfd, msg, len, flags */
         return do_sendto(a[0], a[1], a[2], a[3], 0, 0);
     case TARGET_SYS_RECV: /* sockfd, msg, len, flags */
-        return do_recvfrom(a[0], a[1], a[2], a[3], 0, 0);
+        return do_recvfrom(cpu, a[0], a[1], a[2], a[3], 0, 0);
     case TARGET_SYS_SENDTO: /* sockfd, msg, len, flags, addr, addrlen */
         return do_sendto(a[0], a[1], a[2], a[3], a[4], a[5]);
     case TARGET_SYS_RECVFROM: /* sockfd, msg, len, flags, addr, addrlen */
-        return do_recvfrom(a[0], a[1], a[2], a[3], a[4], a[5]);
+        return do_recvfrom(cpu, a[0], a[1], a[2], a[3], a[4], a[5]);
     case TARGET_SYS_SHUTDOWN: /* sockfd, how */
         return get_errno(shutdown(a[0], a[1]));
     case TARGET_SYS_SETSOCKOPT: /* sockfd, level, optname, optval, optlen */
@@ -8858,7 +8860,7 @@ static abi_long do_syscall1(void *cpu_env, int num, abi_long arg1,
         if (!(p = lock_user(VERIFY_READ, arg2, arg3, 1)))
             return -TARGET_EFAULT;
         if (arg1 == FITM_FD) {
-            ret = get_errno(safe_write(fitm_out_fd, p, arg3))
+            ret = get_errno(safe_write(fitm_out_fd, p, arg3));
         } else if (fd_trans_target_to_host_data(arg1)) {
             void *copy = g_malloc(arg3);
             memcpy(copy, p, arg3);
@@ -8906,6 +8908,7 @@ static abi_long do_syscall1(void *cpu_env, int num, abi_long arg1,
 #endif
     case TARGET_NR_close:
         if (arg1 == FITM_FD) {
+            FDBG("Ignored close on FITM_FD");
             return 0;
         }
         fd_trans_unregister(arg1);
@@ -10465,7 +10468,7 @@ static abi_long do_syscall1(void *cpu_env, int num, abi_long arg1,
 #endif
 #ifdef TARGET_NR_socketcall
     case TARGET_NR_socketcall:
-        return do_socketcall(arg1, arg2);
+        return do_socketcall(cpu, arg1, arg2);
 #endif
 #ifdef TARGET_NR_accept
     case TARGET_NR_accept:
@@ -10497,15 +10500,20 @@ static abi_long do_syscall1(void *cpu_env, int num, abi_long arg1,
 #endif
 #ifdef TARGET_NR_listen
     case TARGET_NR_listen:
+        // TODO: endianness of arg1?
+        if (arg1 == FITM_FD) {
+            FDBG("Listen ignored for FITM_FD")
+            return 0;
+        }
         return get_errno(listen(arg1, arg2));
 #endif
 #ifdef TARGET_NR_recv
     case TARGET_NR_recv:
-        return do_recvfrom(arg1, arg2, arg3, arg4, 0, 0);
+        return do_recvfrom(cpu, arg1, arg2, arg3, arg4, 0, 0);
 #endif
 #ifdef TARGET_NR_recvfrom
     case TARGET_NR_recvfrom:
-        return do_recvfrom(arg1, arg2, arg3, arg4, arg5, arg6);
+        return do_recvfrom(cpu, arg1, arg2, arg3, arg4, arg5, arg6);
 #endif
 #ifdef TARGET_NR_recvmsg
     case TARGET_NR_recvmsg:
@@ -10533,7 +10541,9 @@ static abi_long do_syscall1(void *cpu_env, int num, abi_long arg1,
 #endif
 #ifdef TARGET_NR_shutdown
     case TARGET_NR_shutdown:
-        if (arg1 == FITM_FD) { return 0; 
+        if (arg1 == FITM_FD) { 
+            FDBG("Ignored shutdown for FITM_FD");
+            return 0; }
         return get_errno(shutdown(arg1, arg2));
 #endif
 #if defined(TARGET_NR_getrandom) && defined(__NR_getrandom)
