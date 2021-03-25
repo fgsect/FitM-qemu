@@ -137,6 +137,79 @@
 #include "qemuafl/common.h"
 #include "qemuafl/qasan-qemu.h"
 
+#ifndef NO_FITM
+// fitm specific hearders
+#include <sys/select.h>
+#include <sys/stat.h>
+#include "qemuafl/fitm-criu.h"
+
+
+// We originally used FD 0 to send input from afl into the target
+// However targets may use FD 0 to wait for an interrupt from the user or sth similar
+// Since using fitm_in_file we need to set FITM_FD to the current FD value
+// Checkout: man 2 select --> bugs: FD_SETSIZE is limited to 1024
+#define FITM_FD 999
+// Use this define to toggle debug prints in various places
+// Might be spammy
+// #define FITM_DEBUG 1
+// Remove FITM_FAST_EXIT if you want an orderly exit of the target
+#define FITM_FAST_EXIT 1
+// Remove this define temporarily to ignore do_criu() calls
+// This might be useful when debugging targets where a specific behaviour is solicited after a snapshot
+#define INCLUDE_DOCRIU 1
+// The next receive after send should create a snapshot
+// Idea is: We're waiting for a return from the other side then
+
+// If undefined, contines in the parent instead.
+#define FITM_FORK_FOLLOW_CHILD 1
+// If defined, will _exit(0) for an accept after fuzzing has started.
+//#define FITM_ACCEPT_ONCE 1
+
+// Randomly chosen offsets in the AFL Bitmp, to emphasize sent operations for afl.
+// >> Make sure we don't minimize it.
+#define AFL_MAP_SENDTO (1<<3)
+#define AFL_MAP_WRITE (1<<4)
+#define AFL_MAP_READ (1<<5)
+
+bool sent = true;
+bool env_init = false;
+// If true, we are supposed to write the outputs to a file.
+// This is set after each restore. Before the first restore we are doing the init run. Within the init run we don't want
+// any outputs as they will mess up the outputs of the following snapshots
+bool create_outputs = true; //TODO: works? getenv_from_file("FITM_CREATE_OUTPUTS");
+// If true, please do snapshot.
+// we are restored or snapshottet or something.
+bool timewarp_mode = true; //TODO: works? getenv_from_file("LETS_DO_THE_TIMEWARP_AGAIN");
+// If fitm_replay is set, all snapshotting and early exits are disabled. It'll replay a whole input.
+bool fitm_replay = false;
+// live555 server tries to find it's own IP adr by sending & recveiving a multicast packet
+// this results in a recv before the recv that waits for client input
+// this variable should help identify the correct recv call to snapshot by indicating if the recv call
+// happened after accept has been called at least once
+// We also send fitm_mode_started to true if we sent on this port once (then it's open.)
+// (Unless we have recv_skip still set, then it's a different port alltogether...)
+bool fitm_mode_started = false;
+// This holds the (potential) output file descriptor
+int fitm_out_fd = -1;
+// Instead of dup()ing to 1337, we just keep a shadow fd for input.
+FILE *fitm_in_file = NULL;
+// For some targets (e.g. live555) we want to discard the first n recv calls
+// This variable configures how many recvs are skipped
+bool count_recvs = true;
+int init_recv_skip = 0;
+
+
+// FITM specific: for debug prints, use FDBG.
+#ifdef FITM_DEBUG
+#define FDBG(...) printf("[QEMU] " __VA_ARGS__); fflush(stdout)
+#else
+#define FDBG(...)
+#endif
+
+extern unsigned int afl_forksrv_pid;
+
+#endif /* NO_FITM */
+
 #ifndef CLONE_IO
 #define CLONE_IO                0x80000000      /* Clone io context */
 #endif
@@ -1550,6 +1623,29 @@ static abi_long do_pselect6(abi_long arg1, abi_long arg2, abi_long arg3,
         ts_ptr = NULL;
     }
 
+    // we are fuzzing we want to return immediately if select is called for our FD.
+    if ((wfds_ptr && FD_ISSET(FITM_FD, &wfds)) || (rfds_ptr && FD_ISSET(FITM_FD, &rfds)) || (efds_ptr && FD_ISSET(FITM_FD, &efds))) {
+        // Ignoring read/write distinction here, no target would care
+        FD_ZERO(&efds);
+        FD_ZERO(&wfds);
+        FD_ZERO(&rfds);
+        FD_SET(FITM_FD, &rfds);
+        FD_SET(FITM_FD, &wfds);
+
+        if (rfd_addr && copy_to_user_fdset(rfd_addr, &rfds, n))
+            return -TARGET_EFAULT;
+        if (wfd_addr && copy_to_user_fdset(wfd_addr, &wfds, n))
+            return -TARGET_EFAULT;
+        if (efd_addr && copy_to_user_fdset(efd_addr, &efds, n))
+            return -TARGET_EFAULT;
+
+        // Ignoring timing for now.
+        // if (ts_addr && host_to_target_timespec(ts_addr, &ts))
+        //    return -TARGET_EFAULT;
+
+        return 1;
+    }
+
     /* Extract the two packed args for the sigset */
     if (arg6) {
         sig_ptr = &sig;
@@ -1637,6 +1733,19 @@ static abi_long do_ppoll(abi_long arg1, abi_long arg2, abi_long arg3,
         for (i = 0; i < nfds; i++) {
             pfd[i].fd = tswap32(target_pfd[i].fd);
             pfd[i].events = tswap16(target_pfd[i].events);
+            
+            if (pfd[i].fd == FITM_FD) {
+
+                // If we're fuzzing, immediately return on poll for FITM_FD.
+                uint16_t response = tswap16(target_pfd[i].events) & (POLLIN | POLLOUT);
+                target_pfd[i].revents = tswap16(response);
+
+                unlock_user(target_pfd, arg1, sizeof(struct target_pollfd) * nfds);
+                
+                return 1;
+
+            }
+
         }
     }
     if (ppoll) {
@@ -2199,6 +2308,13 @@ static inline abi_long host_to_target_cmsg(struct target_msghdr *target_msgh,
 static abi_long do_setsockopt(int sockfd, int level, int optname,
                               abi_ulong optval_addr, socklen_t optlen)
 {
+
+    if (sockfd == FITM_FD) {
+        FDBG("Do_setsockopt returning 0");
+        return 0
+    }
+
+
     abi_long ret;
     int val;
     struct ip_mreqn *ip_mreq;
@@ -2659,6 +2775,12 @@ set_timeout:
 static abi_long do_getsockopt(int sockfd, int level, int optname,
                               abi_ulong optval_addr, abi_ulong optlen)
 {
+
+    if (sockfd == FITM_FD) {
+        FDBG("Hooked getsockopt: returning 0");
+        return 0; 
+    }
+
     abi_long ret;
     int len, val;
     socklen_t lv;
@@ -3253,6 +3375,13 @@ static int sock_flags_fixup(int fd, int target_type)
 /* do_socket() Must return target values and target errnos. */
 static abi_long do_socket(int domain, int type, int protocol)
 {
+
+    if (domain == AF_INET || domain == AF_INET6) {
+        FDBG("do_socket: returning FITM_FD\n");
+        return FITM_FD;
+    }
+    FDBG("Socket() called for non-inet protocol\n")
+
     int target_type = type;
     int ret;
 
@@ -3308,6 +3437,15 @@ static abi_long do_socket(int domain, int type, int protocol)
 static abi_long do_bind(int sockfd, abi_ulong target_addr,
                         socklen_t addrlen)
 {
+
+    if (sockfd == FITM_FD) {
+        FDBG("do_bind ignored for FITM_FD\n");
+        // Adress binding always works as we are only writing to a file
+        // check: https://github.com/zardus/preeny/blob/master/src/desock.c#L259
+        return 0;
+    }
+    FDBG("do_bind called on non-fitm sockfd %d\n", sockfd);  
+
     void *addr;
     abi_long ret;
 
@@ -3328,6 +3466,16 @@ static abi_long do_bind(int sockfd, abi_ulong target_addr,
 static abi_long do_connect(int sockfd, abi_ulong target_addr,
                            socklen_t addrlen)
 {
+
+    if (sockfd == FITM_FD) {
+        FDBG("do_connect ignored for %d\n", sockfd);
+        // Connecting to a remote adr. always works as we are only running locally
+        // Check: https://github.com/zardus/preeny/blob/master/src/desock.c#L275
+        fitm_mode_started = true;
+        return 0;
+    }
+    FDBG("do_connect called on non-fitm sockfd %d\n", sockfd);
+
     void *addr;
     abi_long ret;
 
@@ -3401,6 +3549,15 @@ static abi_long do_sendrecvmsg_locked(int fd, struct target_msghdr *msgp,
     msg.msg_iov = vec;
 
     if (send) {
+
+        if (fitm_mode_started)  {
+            // TODO
+            printf("[FITM] TODO: implement send(m)msg");
+            exit(1);
+            ret = 0;
+            goto out;
+        }
+
         if (fd_trans_target_to_host_data(fd)) {
             void *host_msg;
 
@@ -3420,6 +3577,14 @@ static abi_long do_sendrecvmsg_locked(int fd, struct target_msghdr *msgp,
             }
         }
     } else {
+
+        if (fitm_mode_started)  {
+            // TODO
+            printf("[FITM] TODO: implement recv(m)msg");
+            //ret = 0;
+            //goto out;
+        }
+
         ret = get_errno(safe_recvmsg(fd, &msg, flags));
         if (!is_error(ret)) {
             len = ret;
@@ -3519,6 +3684,34 @@ static abi_long do_sendrecvmmsg(int fd, abi_ulong target_msgvec,
 static abi_long do_accept4(int fd, abi_ulong target_addr,
                            abi_ulong target_addrlen_addr, int flags)
 {
+
+    /*
+    FITM_FD 
+
+    do_socket() -> FITM_FD
+    accept() -> FITM_FD
+
+    read, recv -> #read (FITM_FD)
+    write, send -> #send (FITM_FD)
+
+    clone -> follow child
+    */
+
+    // Exit once we accepted once because we can only provide one input per fuzz child
+    if (fitm_mode_started) {
+        FDBG("Second accept after FITM started. Odd for some targets.");
+#ifdef FITM_ACCEPT_ONCE
+        _exit(0);
+#endif
+        return FITM_FD;
+    }
+    
+    fitm_mode_started = true;
+    sent = true; // << Adding this as fix for the server - it won't send anything, but immediately
+
+    return FITM_FD;
+    // Ingoring all the rest after FITM
+
     socklen_t addrlen, ret_addrlen;
     void *addr;
     abi_long ret;
@@ -3576,8 +3769,26 @@ static abi_long do_getpeername(int fd, abi_ulong target_addr,
 
     addr = alloca(addrlen);
 
-    ret_addrlen = addrlen;
-    ret = get_errno(getpeername(fd, addr, &ret_addrlen));
+    if (fitm_mode_started) {
+        FDBG("getpeername(): fitm_mode_started branch\n");
+        struct sockaddr *addr_pointer = (struct sockaddr*) addr;
+        addr_pointer->sa_family = AF_INET;
+        // sa_data is 14 bytes long
+        // could not find an exact description, figured out by trail and error
+        // for details: https://www.freebsd.org/doc/en/books/developers-handbook/sockets-essential-functions.html
+        addr_pointer->sa_data[2] = 42;
+        addr_pointer->sa_data[3] = 0;
+        addr_pointer->sa_data[4] = 0;
+        addr_pointer->sa_data[5] = 42;
+
+        ret = 0;
+    } else {
+        FDBG("getpeername(): not accepted branch\n");
+
+        ret_addrlen = addrlen;
+        ret = get_errno(getpeername(fd, addr, &ret_addrlen));
+    }
+
     if (!is_error(ret)) {
         host_to_target_sockaddr(target_addr, addr, MIN(addrlen, ret_addrlen));
         if (put_user_u32(ret_addrlen, target_addrlen_addr)) {
@@ -3608,8 +3819,30 @@ static abi_long do_getsockname(int fd, abi_ulong target_addr,
 
     addr = alloca(addrlen);
 
-    ret_addrlen = addrlen;
-    ret = get_errno(getsockname(fd, addr, &ret_addrlen));
+    /*
+     * struct sockaddr{
+            sa_family_t   sa_family       address family
+            char          sa_data[]       socket address (variable-length data)
+        };
+     */
+    if (fitm_mode_started) {
+        FDBG("getsockname(): fitm_mode_started branch\n");
+        struct sockaddr *addr_pointer = (struct sockaddr*) addr;
+        addr_pointer->sa_family = AF_INET;
+        // sa_data is 14 bytes long
+        // could not find an exact description, figured out by trail and error
+        // for details: https://www.freebsd.org/doc/en/books/developers-handbook/sockets-essential-functions.html
+        addr_pointer->sa_data[2] = 42;
+        addr_pointer->sa_data[3] = 0;
+        addr_pointer->sa_data[4] = 0;
+        addr_pointer->sa_data[5] = 42;
+
+        ret = 0;
+    } else {
+        ret_addrlen = addrlen;
+        ret = get_errno(getsockname(fd, addr, &ret_addrlen));
+    }
+
     if (!is_error(ret)) {
         host_to_target_sockaddr(target_addr, addr, MIN(addrlen, ret_addrlen));
         if (put_user_u32(ret_addrlen, target_addrlen_addr)) {
@@ -3637,10 +3870,77 @@ static abi_long do_socketpair(int domain, int type, int protocol,
     return ret;
 }
 
+// Initialize, or do not. There is no try.
+static void fitm_ensure_initialized(void) {
+    if(!env_init){
+        FDBG("env_init\n");
+        create_outputs = getenv_from_file("FITM_CREATE_OUTPUTS");
+        timewarp_mode = getenv_from_file("LETS_DO_THE_TIMEWARP_AGAIN");
+
+        fitm_replay = getenv("FITM_REPLAY") && *getenv("FITM_REPLAY");
+
+        if (count_recvs){
+            // Ignore any possible error
+            char* init_recv_skip_tmp = getenv_from_file("INIT_RECV_SKIP");
+            if(init_recv_skip_tmp){
+                init_recv_skip = atoi(init_recv_skip_tmp);
+            }
+        }
+
+        if (create_outputs) {
+            // Open FD for writing. :)
+            char *uuid = get_new_uuid();
+            char path[44] = "./fd/";
+            strncat(path, uuid, 37);
+            int new_fd = open(path, O_RDWR | O_CREAT, 0666);
+            if (new_fd == -1) {
+                perror("do_socket(): Error while opening path ./fd/ in do_socket()");
+                _exit(-1);
+            }
+            chmod(path, 0666);
+            fitm_out_fd = new_fd;
+        }
+        env_init = true;
+    }
+    FDBG(": fitm_ensure_initialized() create_outputs %d, timewarp_mode %d, fitm_out_fd %d, init_recv_skip %d\n", create_outputs, timewarp_mode, fitm_out_fd, init_recv_skip);
+}
+
 /* do_sendto() Must return target values and target errnos. */
 static abi_long do_sendto(int fd, abi_ulong msg, size_t len, int flags,
                           abi_ulong target_addr, socklen_t addrlen)
 {
+
+ if (fd == FITM_FD) {
+
+        fitm_ensure_initialized();
+        sent = true;
+
+        if (init_recv_skip <= 0 && !fitm_mode_started) {
+
+            FDBG("We sent something, so let's set this to fitm_mode_started.");
+            fitm_mode_started = true;
+
+        }
+
+        // If we reached send, we're happy. Increase SENT_ID
+        size_t loc = AFL_MAP_SENDTO;
+        INC_AFL_AREA(loc);
+       
+        // Only write sth to the fd if we are in consolidation
+        if(!create_outputs) {
+            FDBG("Sendto called on FITM_FD -> no outputs\n");
+            return (abi_long)len;
+        } else {
+            if (fitm_out_fd == -1) {
+                printf("[FITM] BUG: fitm_out_fd not set in create_outputs!\n");
+                exit(-1);
+            }
+            FDBG("Sendto called on FITM_FD -> writing to %d\n", fitm_out_fd);
+            // TODO: proper guest2host conversation?
+            return write(fitm_out_fd, (char *) msg, len);
+        }
+    }
+
     void *addr;
     void *host_msg;
     void *copy_msg = NULL;
@@ -3681,6 +3981,125 @@ fail:
     return ret;
 }
 
+
+
+static abi_long fitm_read(CPUState *cpu, int fd, char *msg, size_t len) {
+    if (unlikely(fd != FITM_FD)) {
+        printf("[FITM] BUG: fitm_read may only be called with FITM_FD\n");
+        _exit(-1);
+    }
+    FDBG("fitm_read called from fitm fd %d for len %ld.\n", fd, len);
+    fitm_ensure_initialized();
+
+    // Read is always nice to reach.
+    size_t loc = AFL_MAP_READ;
+    INC_AFL_AREA(loc);
+
+
+    // If we sent something, and hit the next recv, either snapshot, or exit.
+    if(sent || unlikely(!fitm_in_file)) {
+
+        if (init_recv_skip > 0) {
+            init_recv_skip -= 1;
+            FDBG("fitm_read: skipping recv by returning empty string\n");
+            return 0;
+        }
+
+        if (fitm_replay) {
+            char* input = getenv_from_file("INPUT_FILENAME");
+            fitm_in_file = fitm_open_input_file(input);
+        } else if (!timewarp_mode) {
+            FDBG("we are done here. Have a nice day.\n");
+            _exit(0);
+        } else if (timewarp_mode){
+            count_recvs = false;
+            sent = false; // After restore, we'll await the next sent before criuin' again
+
+            // We reached our goal! :)
+            loc = AFL_MAP_READ + 1;
+            INC_AFL_AREA(loc);
+
+            create_pipes_file();
+
+            if (fitm_out_fd != -1) {
+                FDBG("Create Outputs in Snapshot run (?)\n");
+                close(fitm_out_fd);
+            }
+
+            if (fitm_in_file) {
+                // close the last in file, ready for the next round.
+                fclose(fitm_in_file);
+                // if we don't set this manually, checking fitm_in_file for NULL goes tuttikaputti
+                fitm_in_file = NULL;
+            }
+
+#ifdef INCLUDE_DOCRIU
+            // We close stdout and err as QEMU Strace will write to the stream after the snapshot.
+            // This would break the fitm snapshot restore
+            close(2);
+            if(block_signals()) {
+                printf("[QEMU] Could not block signals for do_criu call\n");
+                fflush(stdout);
+                _exit(-1);
+            }
+            do_criu();
+            // Weird bug making criu restore crash - this solves it
+            sleep(0.2);
+            int stderr_fd = open("./stderr", O_WRONLY | O_APPEND);
+            if (stderr_fd == -1) {
+                printf("[QEMU] Could not reopen stderr\n");
+                fflush(stdout);
+                _exit(-1);
+            }
+            if (stderr_fd != 2) {
+                dup2(stderr_fd, 2);
+                close(stderr_fd);
+            }
+            fprintf(stderr, "\n=== CRIU RESTORED ===\n");
+#endif
+            // If we don't unset here fitm_output_fd is never set since env_init is set to true before the snapshot and never unset
+            env_init = false;
+
+            char* input = getenv_from_file("INPUT_FILENAME");
+
+            fitm_ensure_initialized();
+
+            spawn_forksrv(cpu, timewarp_mode);
+
+            // Make sure all maps contain something, so cmin doesn't kill 'em
+            loc = AFL_MAP_READ + 2;
+            INC_AFL_AREA(loc);
+
+            if (unlikely(fitm_in_file != NULL)) {
+                printf("[FITM] BUG: fitm_open_input_file called twice in one run\n");
+                fflush(stdout);
+                _exit(-1);
+            }
+
+            fitm_in_file = fitm_open_input_file(input);
+        }
+    }
+
+    int ret = fread(msg, 1, len, fitm_in_file);
+    if (ret == -1 && errno == EBADF) {
+        printf("[QEMU] bug: read on closed FITM_FD?\n");
+        perror("FD 1337");
+        fflush(stdout);
+        _exit(-1);
+    } else if (ret == 0) {
+        // Some targets may sleep after the server disconnected.
+        // We lose bugs in teardown code but fuzzing works
+        printf("[QEMU] No more fuzzing input. Exiting now.\n");
+        fflush(stdout);
+        // FOR FTP USE THIS:
+         _exit(0);
+    };
+    FDBG("read: %d bytes with msg: %s\n", ret, msg);
+    // TODO: We completely ignore changes in endianness (get_errno et al. could be used)
+    return ret;
+}
+
+
 /* do_recvfrom() Must return target values and target errnos. */
 static abi_long do_recvfrom(int fd, abi_ulong msg, size_t len, int flags,
                             abi_ulong target_addr,
@@ -3694,6 +4113,16 @@ static abi_long do_recvfrom(int fd, abi_ulong msg, size_t len, int flags,
     host_msg = lock_user(VERIFY_WRITE, msg, len, 0);
     if (!host_msg)
         return -TARGET_EFAULT;
+
+    if (fd == FITM_FD) {
+        FDBG("recvfrom for %ld bytes", len);
+        ret = fitm_read(cpu, fd, (char *)host_msg, len);
+        unlock_user(host_msg, msg, len);
+        return ret;
+    
+    }
+    FDBG("recvfrom for non-fitm fm (%d), %ld bytes", fd, len);
+
     if (target_addr) {
         if (get_user_u32(addrlen, target_addrlen)) {
             ret = -TARGET_EFAULT;
@@ -4395,7 +4824,7 @@ static inline abi_long do_msgsnd(int msqid, abi_long msgp,
 }
 
 #ifdef __NR_ipc
-#if defined(__sparc__)
+#if defined(__sparc__)/for
 /* SPARC for msgrcv it does not use the kludge on final 2 arguments.  */
 #define MSGRCV_ARGS(__msgp, __msgtyp) __msgp, __msgtyp
 #elif defined(__s390x__)
@@ -6541,6 +6970,30 @@ static int do_fork(CPUArchState *env, unsigned int flags, abi_ulong newsp,
             tb_flush(cpu);
         }
 
+
+        if (fitm_mode_started) {
+            FDBG("do_fork(): fitm_mode_started. We don't clone anymore.\n");
+            pthread_mutex_unlock(&info.mutex);
+//            pthread_cond_destroy(&info.cond);
+            pthread_mutex_destroy(&info.mutex);
+            pthread_mutex_unlock(&clone_lock);
+
+#ifdef FITM_FORK_FOLLOW_CHILD
+
+            // should never return from this call
+            FDBG("Returning from clone as parent");
+            clone_func(&info);
+
+            fprintf(stderr, "This should be dead code\n");
+            fflush(stderr);
+            _exit(-1);
+#else
+            FDBG("Returning from clone as parent");
+            return 0;
+#endif
+        }
+        FDBG("do_fork(): pthread_create()\n");
+
         ret = pthread_create(&info.thread, &attr, clone_func, &info);
         /* TODO: Free new CPU state if thread creation failed.  */
 
@@ -6568,12 +7021,30 @@ static int do_fork(CPUArchState *env, unsigned int flags, abi_ulong newsp,
             return -TARGET_EINVAL;
         }
 
+        // Fake fork after we started the server
+        if (fitm_mode_started) {
+            FDBG("do_fork(): fitm_mode_started. We don't fork anymore.\n");
+    #ifdef FITM_FORK_FOLLOW_CHILD
+            FDBG("Returning from fork as child");
+            return 1337;
+    #else
+            FDBG("Returning from fork as parent");
+            return 0;
+    #endif
+        }
+
+
         if (block_signals()) {
             return -TARGET_ERESTARTSYS;
         }
 
         fork_start();
-        ret = fork();
+        if (fitm_mode_started) {
+            ret = 0;
+            fork_end(0);
+        } else {
+            ret = fork();
+        }
         if (ret == 0) {
             /* Child Process.  */
             cpu_clone_regs_child(env, newsp, flags);
@@ -6928,6 +7399,12 @@ static abi_long do_fcntl(int fd, int cmd, abi_ulong arg)
         break;
 
     case TARGET_F_GETFL:
+
+        if (fd == FITM_FD) {
+            FDBG("fcntl(GETFL) handled for FITM_FD\n");
+            return O_SYNC | O_RDWR;
+        }
+
         ret = get_errno(safe_fcntl(fd, host_cmd, arg));
         if (ret >= 0) {
             ret = host_to_target_bitmask(ret, fcntl_flags_tbl);
@@ -6935,6 +7412,12 @@ static abi_long do_fcntl(int fd, int cmd, abi_ulong arg)
         break;
 
     case TARGET_F_SETFL:
+
+        if (fd == FITM_FD) {
+            FDBG("fcntl(SETFL) handled for FITM_FD\n");
+            return 0;
+        }
+
         ret = get_errno(safe_fcntl(fd, host_cmd,
                                    target_to_host_bitmask(arg,
                                                           fcntl_flags_tbl)));
@@ -8281,6 +8764,18 @@ static abi_long do_syscall1(void *cpu_env, int num, abi_long arg1,
            and _exit_group is used for application termination.
            Do thread termination if we have more then one thread.  */
 
+        // More forecful exit
+        if ((arg1 & 0xFF) == 42) {
+            printf( "Target tried to exit with reseved exit code (42).\n"
+                    "Reserved for criu-snapshots: \"qemu/qemu/linux-user/criu.h\"\n");
+            _exit(43);
+        }
+        FDBG("exit: Target tried to exit with exitcode %ld\n", arg1);
+#ifdef FITM_FAST_EXIT
+        arg1 = 0;
+        _exit(arg1);
+#endif
+
         if (block_signals()) {
             return -TARGET_ERESTARTSYS;
         }
@@ -8321,6 +8816,11 @@ static abi_long do_syscall1(void *cpu_env, int num, abi_long arg1,
         } else {
             if (!(p = lock_user(VERIFY_WRITE, arg2, arg3, 0)))
                 return -TARGET_EFAULT;
+            if (arg1 == FITM_FD) {
+                ret = fitm_read(cpu, arg1, p, arg3);
+                unlock_user(p, arg2, ret);
+                return ret;
+            }
             ret = get_errno(safe_read(arg1, p, arg3));
             if (ret >= 0 &&
                 fd_trans_host_to_target_data(arg1)) {
@@ -8330,12 +8830,36 @@ static abi_long do_syscall1(void *cpu_env, int num, abi_long arg1,
         }
         return ret;
     case TARGET_NR_write:
+
+        if (arg1 == FITM_FD) {
+      
+            // TODO: Remove code duplication to send_to write here.
+            fitm_ensure_initialized();
+            if (init_recv_skip <= 0 && !fitm_mode_started) {
+
+                FDBG("We wrote something, so let's set this to fitm_mode_started.");
+                fitm_mode_started = true;
+
+            }
+
+            FDBG("setting sent = true\n");
+            // If we reached write, we're happy. Increase WRITE_ID.
+            size_t loc = AFL_MAP_WRITE;
+            INC_AFL_AREA(loc);
+            sent = true;
+            if (!create_outputs) {
+                FDBG("write(): ignoring all outputs\n");
+                return arg3;
+            }
+        }
         if (arg2 == 0 && arg3 == 0) {
             return get_errno(safe_write(arg1, 0, 0));
         }
         if (!(p = lock_user(VERIFY_READ, arg2, arg3, 1)))
             return -TARGET_EFAULT;
-        if (fd_trans_target_to_host_data(arg1)) {
+        if (arg1 == FITM_FD) {
+            ret = get_errno(safe_write(fitm_out_fd, p, arg3))
+        } else if (fd_trans_target_to_host_data(arg1)) {
             void *copy = g_malloc(arg3);
             memcpy(copy, p, arg3);
             ret = fd_trans_target_to_host_data(arg1)(copy, arg3);
@@ -8381,6 +8905,9 @@ static abi_long do_syscall1(void *cpu_env, int num, abi_long arg1,
         return ret;
 #endif
     case TARGET_NR_close:
+        if (arg1 == FITM_FD) {
+            return 0;
+        }
         fd_trans_unregister(arg1);
         return get_errno(close(arg1));
 
@@ -8909,6 +9436,11 @@ static abi_long do_syscall1(void *cpu_env, int num, abi_long arg1,
         return ret;
 #endif
     case TARGET_NR_dup:
+        if (arg1 == FITM_FD) {
+            FDBG("dup returning FITM_FD\n");
+            // just return the same fd again. May work.
+            return FITM_FD;
+        }        
         ret = get_errno(dup(arg1));
         if (ret >= 0) {
             fd_trans_dup(arg1, ret);
@@ -10000,6 +10532,7 @@ static abi_long do_syscall1(void *cpu_env, int num, abi_long arg1,
 #endif
 #ifdef TARGET_NR_shutdown
     case TARGET_NR_shutdown:
+        if (arg1 == FITM_FD) { return 0; 
         return get_errno(shutdown(arg1, arg2));
 #endif
 #if defined(TARGET_NR_getrandom) && defined(__NR_getrandom)
@@ -10121,6 +10654,19 @@ static abi_long do_syscall1(void *cpu_env, int num, abi_long arg1,
 #ifdef TARGET_NR_fstat
     case TARGET_NR_fstat:
         {
+            if (arg1 == FITM_FD) {
+                struct target_stat *target_st;
+                if (!lock_user_struct(VERIFY_WRITE, target_st, arg2, 0)) {
+                    return -TARGET_EFAULT;
+                }
+                memset(target_st, 0, sizeof(*target_st));
+                __put_user(16, &target_st->st_size);
+                __put_user(S_IFSOCK, &target_st->st_mode);
+                unlock_user_struct(target_st, arg2, 1);
+                FDBG("Handled fstat\n");
+                return 0;
+            }
+
             ret = get_errno(fstat(arg1, &st));
 #if defined(TARGET_NR_stat) || defined(TARGET_NR_lstat)
         do_stat:
