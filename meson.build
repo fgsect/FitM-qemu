@@ -2228,10 +2228,13 @@ foreach target : target_dirs
       exe_name += '-unsigned'
     endif
 
+    # For FITM: Find criu as dependency.
+    criu_dep = dependency('criu')
+
     emulator = executable(exe_name, exe['sources'],
                install: true,
                c_args: c_args,
-               dependencies: arch_deps + deps + exe['dependencies'],
+               dependencies: arch_deps + deps + [criu_dep] + exe['dependencies'],
                objects: lib.extract_all_objects(recursive: true),
                link_language: link_language,
                link_depends: [block_syms, qemu_syms] + exe.get('link_depends', []),
