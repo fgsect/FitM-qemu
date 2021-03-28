@@ -25,7 +25,6 @@
 
 //char* get_new_uuid(void);
 int do_criu(void);
-char* concat3(char *first, char *second, char *third);
 FILE *fitm_open_input_file(char *input);
 void spawn_forksrv(CPUState *cpu, bool timewarp_mode);
 void create_pipes_file(void);
@@ -196,12 +195,3 @@ char* get_new_uuid(void){
     return uuid;
 }
 */
-
-char* concat3(char *first, char *second, char *third){
-    size_t new_max_len = strlen(first) + strlen(second) + strlen(third) + 4;
-    char *ret = (char *)calloc(new_max_len, sizeof(char));
-    strncpy(ret, first, new_max_len);
-    strncat(ret, second, new_max_len - strlen(ret));
-    strncat(ret, third, new_max_len - strlen(ret));
-    return ret;
-}
