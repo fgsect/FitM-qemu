@@ -151,7 +151,7 @@
 #define FITM_FD 999
 // Use this define to toggle debug prints in various places
 // Might be spammy
-// #define FITM_DEBUG 1
+#define FITM_DEBUG 1
 // Remove FITM_FAST_EXIT if you want an orderly exit of the target
 #define FITM_FAST_EXIT 1
 // Remove this define temporarily to ignore do_criu() calls
@@ -171,33 +171,37 @@
 #define AFL_MAP_WRITE (1<<4)
 #define AFL_MAP_READ (1<<5)
 
-bool sent = true;
-bool env_init = false;
+static bool sent = true;
+static bool env_init = false;
 // If true, we are supposed to write the outputs to a file.
 // This is set after each restore. Before the first restore we are doing the init run. Within the init run we don't want
 // any outputs as they will mess up the outputs of the following snapshots
-bool create_outputs = true; //TODO: works? getenv_from_file("FITM_CREATE_OUTPUTS");
+static bool create_outputs = true; //TODO: works? getenv_from_file("FITM_CREATE_OUTPUTS");
 // If true, please do snapshot.
 // we are restored or snapshottet or something.
-bool timewarp_mode = true; //TODO: works? getenv_from_file("LETS_DO_THE_TIMEWARP_AGAIN");
+static bool timewarp_mode = true; //TODO: works? getenv_from_file("LETS_DO_THE_TIMEWARP_AGAIN");
 // If fitm_replay is set, all snapshotting and early exits are disabled. It'll replay a whole input.
-bool fitm_replay = false;
+static bool fitm_replay = false;
 // live555 server tries to find it's own IP adr by sending & recveiving a multicast packet
 // this results in a recv before the recv that waits for client input
 // this variable should help identify the correct recv call to snapshot by indicating if the recv call
 // happened after accept has been called at least once
 // We also send fitm_mode_started to true if we sent on this port once (then it's open.)
 // (Unless we have recv_skip still set, then it's a different port alltogether...)
-bool fitm_mode_started = false;
+static bool fitm_mode_started = false;
 // This holds the (potential) output file descriptor
-int fitm_out_fd = -1;
+static int fitm_out_fd = -1;
 // Instead of dup()ing to 1337, we just keep a shadow fd for input.
-FILE *fitm_in_file = NULL;
+static FILE *fitm_in_file = NULL;
 // For some targets (e.g. live555) we want to discard the first n recv calls
 // This variable configures how many recvs are skipped
-bool count_recvs = true;
-int init_recv_skip = 0;
-
+static bool count_recvs = true;
+/// Skips n receive operations at program startup/
+/// For example useful for programs that use sockets to get their own ip address
+static int init_recv_skip = 0;
+/// Allows the first `n` socket calls to return a proper socket.
+/// Needed for example for getifaddr in libc to function properly.
+static int init_socket_skip = 0;
 
 // FITM specific: for debug prints, use FDBG.
 #ifdef FITM_DEBUG
@@ -2308,7 +2312,7 @@ static abi_long do_setsockopt(int sockfd, int level, int optname,
 {
 
     if (sockfd == FITM_FD) {
-        FDBG("Do_setsockopt returning 0");
+        FDBG("Do_setsockopt returning 0\n");
         return 0;
     }
 
@@ -2775,7 +2779,7 @@ static abi_long do_getsockopt(int sockfd, int level, int optname,
 {
 
     if (sockfd == FITM_FD) {
-        FDBG("Hooked getsockopt: returning 0");
+        FDBG("Hooked getsockopt: returning 0\n");
         return 0; 
     }
 
@@ -3370,15 +3374,72 @@ static int sock_flags_fixup(int fd, int target_type)
     return fd;
 }
 
+// Initialize, or do not. There is no try.
+static void fitm_ensure_initialized(void) {
+    if(!env_init){
+        FDBG("env_init\n");
+        create_outputs = getenv_from_file("FITM_CREATE_OUTPUTS");
+        timewarp_mode = getenv_from_file("LETS_DO_THE_TIMEWARP_AGAIN");
+
+        fitm_replay = getenv("FITM_REPLAY") && *getenv("FITM_REPLAY");
+
+        if (count_recvs){
+            // Ignore any possible error
+            char* init_recv_skip_tmp = getenv_from_file("INIT_RECV_SKIP");
+            if(init_recv_skip_tmp){
+                init_recv_skip = atoi(init_recv_skip_tmp);
+                FDBG("read init_recv_skip with %d\n", init_recv_skip);
+            }
+            char* init_socket_skip_tmp = getenv_from_file("INIT_SOCKET_SKIP");
+            if(init_socket_skip_tmp){
+                init_socket_skip = atoi(init_socket_skip_tmp);
+                FDBG("read init_socket_skip with %d\n", init_socket_skip);
+            }
+        }
+
+        if (create_outputs) {
+            // Open FD for writing. :)
+            struct timeval tv = {0};
+            gettimeofday(&tv, NULL);
+            long time_millis = (long) ((tv.tv_sec) * 1000 + (tv.tv_usec) / 1000);
+            //char *uuid = get_new_uuid();
+            char path[44] = {0};
+            snprintf(path, sizeof(path), "./fd/%ld", time_millis);
+            //strncat(path, uuid, 37);
+            int new_fd = open(path, O_RDWR | O_CREAT, 0666);
+            if (new_fd == -1) {
+                perror("do_socket(): Error while opening path ./fd/ in do_socket()");
+                _exit(-1);
+            }
+            chmod(path, 0666);
+            fitm_out_fd = new_fd;
+        }
+        env_init = true;
+    }
+    FDBG(": fitm_ensure_initialized() create_outputs %d, timewarp_mode %d, fitm_out_fd %d, init_recv_skip %d\n", create_outputs, timewarp_mode, fitm_out_fd, init_recv_skip);
+}
+
+
 /* do_socket() Must return target values and target errnos. */
 static abi_long do_socket(int domain, int type, int protocol)
 {
 
     if (domain == AF_INET || domain == AF_INET6) {
-        FDBG("do_socket: returning FITM_FD\n");
-        return FITM_FD;
+        fitm_ensure_initialized();
+        if (!init_socket_skip) {
+
+            FDBG("do_socket: returning FITM_FD\n");
+            return FITM_FD;
+
+        } else {
+            init_socket_skip--;
+            FDBG("SKIPPED FITM_FD on do_socket(), returning proper socket. new init_socket_skip = %d\n", init_socket_skip);
+        }
+    } else {
+
+        FDBG("Socket() called for non-inet protocol\n");
+
     }
-    FDBG("Socket() called for non-inet protocol\n")
 
     int target_type = type;
     int ret;
@@ -3697,7 +3758,7 @@ static abi_long do_accept4(int fd, abi_ulong target_addr,
 
     // Exit once we accepted once because we can only provide one input per fuzz child
     if (fitm_mode_started) {
-        FDBG("Second accept after FITM started. Odd for some targets.");
+        FDBG("Second accept after FITM started. Odd for some targets.\n");
 #ifdef FITM_ACCEPT_ONCE
         _exit(0);
 #endif
@@ -3868,44 +3929,7 @@ static abi_long do_socketpair(int domain, int type, int protocol,
     return ret;
 }
 
-// Initialize, or do not. There is no try.
-static void fitm_ensure_initialized(void) {
-    if(!env_init){
-        FDBG("env_init\n");
-        create_outputs = getenv_from_file("FITM_CREATE_OUTPUTS");
-        timewarp_mode = getenv_from_file("LETS_DO_THE_TIMEWARP_AGAIN");
 
-        fitm_replay = getenv("FITM_REPLAY") && *getenv("FITM_REPLAY");
-
-        if (count_recvs){
-            // Ignore any possible error
-            char* init_recv_skip_tmp = getenv_from_file("INIT_RECV_SKIP");
-            if(init_recv_skip_tmp){
-                init_recv_skip = atoi(init_recv_skip_tmp);
-            }
-        }
-
-        if (create_outputs) {
-            // Open FD for writing. :)
-            struct timeval tv = {0};
-            gettimeofday(&tv, NULL);
-            long time_millis = (long) ((tv.tv_sec) * 1000 + (tv.tv_usec) / 1000);
-            //char *uuid = get_new_uuid();
-            char path[44] = {0};
-            snprintf(path, sizeof(path), "./fd/%ld", time_millis);
-            //strncat(path, uuid, 37);
-            int new_fd = open(path, O_RDWR | O_CREAT, 0666);
-            if (new_fd == -1) {
-                perror("do_socket(): Error while opening path ./fd/ in do_socket()");
-                _exit(-1);
-            }
-            chmod(path, 0666);
-            fitm_out_fd = new_fd;
-        }
-        env_init = true;
-    }
-    FDBG(": fitm_ensure_initialized() create_outputs %d, timewarp_mode %d, fitm_out_fd %d, init_recv_skip %d\n", create_outputs, timewarp_mode, fitm_out_fd, init_recv_skip);
-}
 
 /* do_sendto() Must return target values and target errnos. */
 static abi_long do_sendto(int fd, abi_ulong msg, size_t len, int flags,
@@ -3919,7 +3943,7 @@ static abi_long do_sendto(int fd, abi_ulong msg, size_t len, int flags,
 
         if (init_recv_skip <= 0 && !fitm_mode_started) {
 
-            FDBG("We sent something, so let's set this to fitm_mode_started.");
+            FDBG("We sent something, so let's set this to fitm_mode_started.\n");
             fitm_mode_started = true;
 
         }
@@ -4117,13 +4141,13 @@ static abi_long do_recvfrom(CPUState *cpu, int fd, abi_ulong msg, size_t len, in
         return -TARGET_EFAULT;
 
     if (fd == FITM_FD) {
-        FDBG("recvfrom for %ld bytes", len);
+        FDBG("recvfrom for %ld bytes\n", len);
         ret = fitm_read(cpu, fd, (char *)host_msg, len);
         unlock_user(host_msg, msg, len);
         return ret;
     
     }
-    FDBG("recvfrom for non-fitm fm (%d), %ld bytes", fd, len);
+    FDBG("recvfrom for non-fitm fm (%d), %ld bytes\n", fd, len);
 
     if (target_addr) {
         if (get_user_u32(addrlen, target_addrlen)) {
@@ -6983,14 +7007,14 @@ static int do_fork(CPUArchState *env, unsigned int flags, abi_ulong newsp,
 #ifdef FITM_FORK_FOLLOW_CHILD
 
             // should never return from this call
-            FDBG("Returning from clone as parent");
+            FDBG("Returning from clone as parent\n");
             clone_func(&info);
 
             fprintf(stderr, "This should be dead code\n");
             fflush(stderr);
             _exit(-1);
 #else
-            FDBG("Returning from clone as parent");
+            FDBG("Returning from clone as parent\n");
             return 0;
 #endif
         }
@@ -7027,10 +7051,10 @@ static int do_fork(CPUArchState *env, unsigned int flags, abi_ulong newsp,
         if (fitm_mode_started) {
             FDBG("do_fork(): fitm_mode_started. We don't fork anymore.\n");
     #ifdef FITM_FORK_FOLLOW_CHILD
-            FDBG("Returning from fork as child");
+            FDBG("Returning from fork as child\n");
             return 1337;
     #else
-            FDBG("Returning from fork as parent");
+            FDBG("Returning from fork as parent\n");
             return 0;
     #endif
         }
@@ -8839,7 +8863,7 @@ static abi_long do_syscall1(void *cpu_env, int num, abi_long arg1,
             fitm_ensure_initialized();
             if (init_recv_skip <= 0 && !fitm_mode_started) {
 
-                FDBG("We wrote something, so let's set this to fitm_mode_started.");
+                FDBG("We wrote something, so let's set this to fitm_mode_started.\n");
                 fitm_mode_started = true;
 
             }
@@ -8908,7 +8932,7 @@ static abi_long do_syscall1(void *cpu_env, int num, abi_long arg1,
 #endif
     case TARGET_NR_close:
         if (arg1 == FITM_FD) {
-            FDBG("Ignored close on FITM_FD");
+            FDBG("Ignored close on FITM_FD\n");
             return 0;
         }
         fd_trans_unregister(arg1);
@@ -10502,7 +10526,7 @@ static abi_long do_syscall1(void *cpu_env, int num, abi_long arg1,
     case TARGET_NR_listen:
         // TODO: endianness of arg1?
         if (arg1 == FITM_FD) {
-            FDBG("Listen ignored for FITM_FD")
+            FDBG("Listen ignored for FITM_FD\n");
             return 0;
         }
         return get_errno(listen(arg1, arg2));
@@ -10542,7 +10566,7 @@ static abi_long do_syscall1(void *cpu_env, int num, abi_long arg1,
 #ifdef TARGET_NR_shutdown
     case TARGET_NR_shutdown:
         if (arg1 == FITM_FD) { 
-            FDBG("Ignored shutdown for FITM_FD");
+            FDBG("Ignored shutdown for FITM_FD\n");
             return 0; }
         return get_errno(shutdown(arg1, arg2));
 #endif
