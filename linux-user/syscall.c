@@ -139,8 +139,8 @@
 
 #ifndef NO_FITM
 // fitm specific headers
-#include <sys/select.h>
-#include <sys/stat.h>
+//#include <sys/select.h>
+//#include <sys/stat.h>
 #include "qemuafl/fitm-criu.h"
 
 
@@ -171,7 +171,7 @@
 #define AFL_MAP_WRITE (1<<4)
 #define AFL_MAP_READ (1<<5)
 
-static bool sent = true;
+static bool fitm_sent = true;
 static bool env_init = false;
 // If true, we are supposed to write the outputs to a file.
 // This is set after each restore. Before the first restore we are doing the init run. Within the init run we don't want
@@ -182,7 +182,7 @@ static bool create_outputs = true; //TODO: works? getenv_from_file("FITM_CREATE_
 static bool timewarp_mode = true; //TODO: works? getenv_from_file("LETS_DO_THE_TIMEWARP_AGAIN");
 // If fitm_replay is set, all snapshotting and early exits are disabled. It'll replay a whole input.
 static bool fitm_replay = false;
-// live555 server tries to find it's own IP adr by sending & recveiving a multicast packet
+// live555 server tries to find it's own IP adr by sending & receiving a multicast packet
 // this results in a recv before the recv that waits for client input
 // this variable should help identify the correct recv call to snapshot by indicating if the recv call
 // happened after accept has been called at least once
@@ -3773,7 +3773,7 @@ static abi_long do_accept4(int fd, abi_ulong target_addr,
     
     FDBG("Returning FITM FD from accept()\n");
     fitm_mode_started = true;
-    sent = true; // << Adding this as fix for the server - it won't send anything, but immediately
+    fitm_sent = true; // << Adding this as fix for the server - it won't send anything, but immediately
 
     return FITM_FD;
     // Ingoring all the rest after FITM
@@ -3944,7 +3944,7 @@ static abi_long do_sendto(int fd, abi_ulong msg, size_t len, int flags,
     if (fd == FITM_FD) {
 
         fitm_ensure_initialized();
-        sent = true;
+        fitm_sent = true;
 
         if (init_recv_skip <= 0 && !fitm_mode_started) {
 
@@ -4028,7 +4028,7 @@ static abi_long fitm_read(CPUState *cpu, int fd, char *msg, size_t len) {
 
 
     // If we sent something, and hit the next recv, either snapshot, or exit.
-    if(sent || unlikely(!fitm_in_file)) {
+    if(fitm_sent || unlikely(!fitm_in_file)) {
 
         if (init_recv_skip > 0) {
             init_recv_skip -= 1;
@@ -4044,7 +4044,7 @@ static abi_long fitm_read(CPUState *cpu, int fd, char *msg, size_t len) {
             _exit(0);
         } else if (timewarp_mode){
             count_recvs = false;
-            sent = false; // After restore, we'll await the next sent before criuin' again
+            fitm_sent = false; // After restore, we'll await the next sent before criuin' again
 
             // We reached our goal! :)
             loc = AFL_MAP_READ + 1;
@@ -8882,7 +8882,7 @@ static abi_long do_syscall1(void *cpu_env, int num, abi_long arg1,
             // If we reached write, we're happy. Increase WRITE_ID.
             size_t loc = AFL_MAP_WRITE;
             INC_AFL_AREA(loc);
-            sent = true;
+            fitm_sent = true;
             if (!create_outputs) {
                 FDBG("write(): ignoring all outputs\n");
                 return arg3;

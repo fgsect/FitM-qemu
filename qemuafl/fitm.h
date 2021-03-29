@@ -1,19 +1,18 @@
+#pragma once
+
 #include <fcntl.h>
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
 
-// ignore return value
-int _ = 0;
-
-char *getenv_from_file(const char *var);
+static char *getenv_from_file(const char *var);
 
 /*
  * Checks if an `envfile` is present. If not checks getenv for the variable.
  * Note: env is not checked if the file is present.
  * Also need to handle NULL as return value in the caller
 */
-char *getenv_from_file(const char *var) {
+static char *getenv_from_file(const char *var) {
     char *found = NULL;
 
     // https://stackoverflow.com/questions/14002954/c-programming-how-to-read-the-whole-file-contents-into-a-buffer
@@ -21,7 +20,11 @@ char *getenv_from_file(const char *var) {
     // pwd is set to the current state folder.
     FILE *f = fopen("envfile", "r");
     if (!f) {
-        return getenv(var);
+        char *env = getenv(var);
+        if (!env) {
+            return NULL;
+        }
+        return strdup(env);
     }
 
     fseek(f, 0, SEEK_END);

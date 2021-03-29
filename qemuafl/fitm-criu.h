@@ -1,4 +1,4 @@
-//
+#pragma once
 // Created by hirnheiner on 11.05.20.
 // Checkout the Makefile
 #include "criu.h"
@@ -11,7 +11,6 @@
 #include <string.h>
 #include <stdio.h>
 #include <unistd.h>
-#include <uuid/uuid.h>
 
 #include "fitm.h"
 
@@ -24,12 +23,12 @@
 
 
 //char* get_new_uuid(void);
-int do_criu(void);
-FILE *fitm_open_input_file(char *input);
-void spawn_forksrv(CPUState *cpu, bool timewarp_mode);
-void create_pipes_file(void);
+static int do_criu(void);
+static FILE *fitm_open_input_file(char *input);
+static void spawn_forksrv(CPUState *cpu, bool timewarp_mode);
+static void create_pipes_file(void);
 
-void create_pipes_file(void) {
+static void create_pipes_file(void) {
     if (fcntl(FRKSRV_READ_FD, F_GETFD) != -1) {
         close(FRKSRV_READ_FD);
     }
@@ -54,21 +53,41 @@ void create_pipes_file(void) {
 
     FILE *f = fopen("./pipes", "w");
     char *buff = calloc(200, 1);
-    _ = readlink("/proc/self/fd/198", buff, 100);
+    if (readlink("/proc/self/fd/198", buff, 100) == -1) {
+        perror("FD 198");
+        exit(1);
+    }
     char *tmp = (&buff[strlen(buff)])+1;
     buff[strlen(buff)] = '\n';
-    _ = readlink("/proc/self/fd/199", tmp, 100);
+    if (readlink("/proc/self/fd/199", tmp, 100) == -1) {
+        perror("FD 199");
+        exit(1);
+    }
     fprintf(f, "%s\n", buff);
     free(buff);
     fclose(f);
 }
 
 #define SHM_FUZZ_ENV_VAR "__AFL_SHM_FUZZ_ID"
-void spawn_forksrv(CPUState *cpu, bool timewarp_mode) {
+static void spawn_forksrv(CPUState *cpu, bool timewarp_mode) {
     if (!timewarp_mode) {
-        char* shm_env_var = getenv_from_file(SHM_ENV_VAR);
 
-        if (shm_env_var) {
+        char *env = getenv_from_file(SHM_ENV_VAR);
+        if (env && *env) {
+            setenv(SHM_ENV_VAR, env, 1);
+            free(env);
+            if ((env = getenv_from_file("AFL_INST_RATIO"))) {
+                setenv("AFL_INST_RATIO", env, 1);
+                free(env);
+            } else {
+                printf("No INST_RATIO\n");
+            }
+            if ((env = getenv_from_file(SHM_FUZZ_ENV_VAR))) {
+                setenv(SHM_FUZZ_ENV_VAR, env, 1);
+                free(env);
+            } else {
+                printf("no shm fuzzing input\n");
+            }
             afl_setup();
             //afl_sharedmem_fuzzing = 1;
             // TODO: AFL_QEMU_PERSISTENT_RET
@@ -79,7 +98,7 @@ void spawn_forksrv(CPUState *cpu, bool timewarp_mode) {
     }
 }
 
-FILE *fitm_open_input_file(char *input) {
+static FILE *fitm_open_input_file(char *input) {
     // We want to get input from files so we pipe the file we get from AFL through an environment var into here.
     // The file is used as stdin
 
@@ -119,7 +138,7 @@ FILE *fitm_open_input_file(char *input) {
     }
 }
 
-int do_criu(void){
+static int do_criu(void){
 
     int dir_fd, exitcode;
     struct criu_opts *criu_request_options = NULL;
@@ -183,15 +202,3 @@ int do_criu(void){
 exit:
     _exit(exitcode);
 }
-
-/*
-char* get_new_uuid(void){
-    // Taken from: https://stackoverflow.com/questions/51053568/generating-a-random-uuid-in-c
-    uuid_t binuuid;
-    uuid_generate_random(binuuid);
-
-    char *uuid = malloc(37);
-    uuid_unparse_lower(binuuid, uuid);
-    return uuid;
-}
-*/
