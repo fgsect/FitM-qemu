@@ -1627,6 +1627,8 @@ static abi_long do_pselect6(abi_long arg1, abi_long arg2, abi_long arg3,
 
     // we are fuzzing we want to return immediately if select is called for our FD.
     if ((wfds_ptr && FD_ISSET(FITM_FD, &wfds)) || (rfds_ptr && FD_ISSET(FITM_FD, &rfds)) || (efds_ptr && FD_ISSET(FITM_FD, &efds))) {
+        FDBG("Returning immediately from select\n");
+
         // Ignoring read/write distinction here, no target would care
         FD_ZERO(&efds);
         FD_ZERO(&wfds);
@@ -1737,6 +1739,7 @@ static abi_long do_ppoll(abi_long arg1, abi_long arg2, abi_long arg3,
             pfd[i].events = tswap16(target_pfd[i].events);
             
             if (pfd[i].fd == FITM_FD) {
+                FDBG("Returning immediately for ppoll\n");
 
                 // If we're fuzzing, immediately return on poll for FITM_FD.
                 uint16_t response = tswap16(target_pfd[i].events) & (POLLIN | POLLOUT);
@@ -2780,7 +2783,7 @@ static abi_long do_getsockopt(int sockfd, int level, int optname,
 
     if (sockfd == FITM_FD) {
         FDBG("Hooked getsockopt: returning 0\n");
-        return 0; 
+        return 0;
     }
 
     abi_long ret;
@@ -3503,7 +3506,7 @@ static abi_long do_bind(int sockfd, abi_ulong target_addr,
         // check: https://github.com/zardus/preeny/blob/master/src/desock.c#L259
         return 0;
     }
-    FDBG("do_bind called on non-fitm sockfd %d\n", sockfd);  
+    FDBG("do_bind called on non-fitm sockfd %d\n", sockfd);
 
     void *addr;
     abi_long ret;
@@ -3609,9 +3612,10 @@ static abi_long do_sendrecvmsg_locked(int fd, struct target_msghdr *msgp,
 
     if (send) {
 
-        if (fitm_mode_started)  {
+        if (fd == FITM_FD)  {
             // TODO
-            printf("[FITM] TODO: implement send(m)msg");
+            fprintf(stderr, "[FITM] TODO: implement send(m)msg\n");
+            fflush(stderr);
             exit(1);
             ret = 0;
             goto out;
@@ -3637,9 +3641,11 @@ static abi_long do_sendrecvmsg_locked(int fd, struct target_msghdr *msgp,
         }
     } else {
 
-        if (fitm_mode_started)  {
+        if (fd == FITM_FD)  {
             // TODO
-            printf("[FITM] TODO: implement recv(m)msg");
+            fprintf(stderr, "[FITM] TODO: implement recv(m)msg\n");
+            fflush(stderr);
+            exit(1);
             //ret = 0;
             //goto out;
         }
@@ -3745,7 +3751,7 @@ static abi_long do_accept4(int fd, abi_ulong target_addr,
 {
 
     /*
-    FITM_FD 
+    FITM_FD
 
     do_socket() -> FITM_FD
     accept() -> FITM_FD
@@ -3765,6 +3771,7 @@ static abi_long do_accept4(int fd, abi_ulong target_addr,
         return FITM_FD;
     }
     
+    FDBG("Returning FITM FD from accept()\n");
     fitm_mode_started = true;
     sent = true; // << Adding this as fix for the server - it won't send anything, but immediately
 
@@ -3828,8 +3835,9 @@ static abi_long do_getpeername(int fd, abi_ulong target_addr,
 
     addr = alloca(addrlen);
 
-    if (fitm_mode_started) {
-        FDBG("getpeername(): fitm_mode_started branch\n");
+    ret_addrlen = addrlen;
+    if (fd == FITM_FD) {
+        FDBG("getpeername(): FITM_FD branch\n");
         struct sockaddr *addr_pointer = (struct sockaddr*) addr;
         addr_pointer->sa_family = AF_INET;
         // sa_data is 14 bytes long
@@ -3842,9 +3850,8 @@ static abi_long do_getpeername(int fd, abi_ulong target_addr,
 
         ret = 0;
     } else {
-        FDBG("getpeername(): not accepted branch\n");
+        FDBG("getpeername() called on non-fitm fd\n");
 
-        ret_addrlen = addrlen;
         ret = get_errno(getpeername(fd, addr, &ret_addrlen));
     }
 
@@ -3878,14 +3885,15 @@ static abi_long do_getsockname(int fd, abi_ulong target_addr,
 
     addr = alloca(addrlen);
 
+    ret_addrlen = addrlen;
     /*
      * struct sockaddr{
             sa_family_t   sa_family       address family
             char          sa_data[]       socket address (variable-length data)
         };
      */
-    if (fitm_mode_started) {
-        FDBG("getsockname(): fitm_mode_started branch\n");
+    if (fd == FITM_FD) {
+        FDBG("getsockname(): FITM_FD branch\n");
         struct sockaddr *addr_pointer = (struct sockaddr*) addr;
         addr_pointer->sa_family = AF_INET;
         // sa_data is 14 bytes long
@@ -3898,7 +3906,6 @@ static abi_long do_getsockname(int fd, abi_ulong target_addr,
 
         ret = 0;
     } else {
-        ret_addrlen = addrlen;
         ret = get_errno(getsockname(fd, addr, &ret_addrlen));
     }
 
@@ -3929,14 +3936,12 @@ static abi_long do_socketpair(int domain, int type, int protocol,
     return ret;
 }
 
-
-
 /* do_sendto() Must return target values and target errnos. */
 static abi_long do_sendto(int fd, abi_ulong msg, size_t len, int flags,
                           abi_ulong target_addr, socklen_t addrlen)
 {
 
- if (fd == FITM_FD) {
+    if (fd == FITM_FD) {
 
         fitm_ensure_initialized();
         sent = true;
@@ -4850,7 +4855,7 @@ static inline abi_long do_msgsnd(int msqid, abi_long msgp,
 }
 
 #ifdef __NR_ipc
-#if defined(__sparc__)/for
+#if defined(__sparc__)
 /* SPARC for msgrcv it does not use the kludge on final 2 arguments.  */
 #define MSGRCV_ARGS(__msgp, __msgtyp) __msgp, __msgtyp
 #elif defined(__s390x__)
@@ -7066,9 +7071,11 @@ static int do_fork(CPUArchState *env, unsigned int flags, abi_ulong newsp,
 
         fork_start();
         if (fitm_mode_started) {
+            FDBG("FitM mode fork end\n");
             ret = 0;
             fork_end(0);
         } else {
+            FDBG("Non-FitM fork\n");
             ret = fork();
         }
         if (ret == 0) {
@@ -8790,10 +8797,11 @@ static abi_long do_syscall1(void *cpu_env, int num, abi_long arg1,
            and _exit_group is used for application termination.
            Do thread termination if we have more then one thread.  */
 
-        // More forecful exit
+        // More forceful exit
         if ((arg1 & 0xFF) == 42) {
             printf( "Target tried to exit with reseved exit code (42).\n"
                     "Reserved for criu-snapshots: \"qemu/qemu/linux-user/criu.h\"\n");
+            fflush(stdout);
             _exit(43);
         }
         FDBG("exit: Target tried to exit with exitcode %ld\n", arg1);
@@ -8843,6 +8851,7 @@ static abi_long do_syscall1(void *cpu_env, int num, abi_long arg1,
             if (!(p = lock_user(VERIFY_WRITE, arg2, arg3, 0)))
                 return -TARGET_EFAULT;
             if (arg1 == FITM_FD) {
+                FDBG("FITM_READ\n");
                 ret = fitm_read(cpu, arg1, p, arg3);
                 unlock_user(p, arg2, ret);
                 return ret;
@@ -8859,6 +8868,7 @@ static abi_long do_syscall1(void *cpu_env, int num, abi_long arg1,
 
         if (arg1 == FITM_FD) {
       
+            FDBG("FitM write\n");
             // TODO: Remove code duplication to send_to write here.
             fitm_ensure_initialized();
             if (init_recv_skip <= 0 && !fitm_mode_started) {
@@ -8884,6 +8894,7 @@ static abi_long do_syscall1(void *cpu_env, int num, abi_long arg1,
         if (!(p = lock_user(VERIFY_READ, arg2, arg3, 1)))
             return -TARGET_EFAULT;
         if (arg1 == FITM_FD) {
+            FDBG("FitM: Safe Write\n");
             ret = get_errno(safe_write(fitm_out_fd, p, arg3));
         } else if (fd_trans_target_to_host_data(arg1)) {
             void *copy = g_malloc(arg3);
@@ -10565,9 +10576,10 @@ static abi_long do_syscall1(void *cpu_env, int num, abi_long arg1,
 #endif
 #ifdef TARGET_NR_shutdown
     case TARGET_NR_shutdown:
-        if (arg1 == FITM_FD) { 
+        if (arg1 == FITM_FD) {
             FDBG("Ignored shutdown for FITM_FD\n");
-            return 0; }
+            return 0;
+        }
         return get_errno(shutdown(arg1, arg2));
 #endif
 #if defined(TARGET_NR_getrandom) && defined(__NR_getrandom)
@@ -10690,6 +10702,7 @@ static abi_long do_syscall1(void *cpu_env, int num, abi_long arg1,
     case TARGET_NR_fstat:
         {
             if (arg1 == FITM_FD) {
+                FDBG("FITM_FD fstat\n");
                 struct target_stat *target_st;
                 if (!lock_user_struct(VERIFY_WRITE, target_st, arg2, 0)) {
                     return -TARGET_EFAULT;
