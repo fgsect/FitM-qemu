@@ -171,6 +171,15 @@
 #define AFL_MAP_WRITE (1<<4)
 #define AFL_MAP_READ (1<<5)
 
+// We don't allow more than FITM_EPOLL_MAX epoll entries for FITM FDs (increasing the number will use more memory)
+#define FITM_EPOLL_MAX (64)
+
+// FTIM Epoll handling has two arrays: one mapping data offset to fd, one containing the epoll data.
+// The fd is initialized with -1 (Since 0 is a valid efd).
+static int fitm_epoll_fd_ids[FITM_EPOLL_MAX] = {-1};
+// The data for epoll.
+static struct epoll_event fitm_epoll_events[FITM_EPOLL_MAX] = {0};
+
 static bool fitm_sent = true;
 static bool env_init = false;
 // If true, we are supposed to write the outputs to a file.
@@ -209,6 +218,8 @@ static int init_socket_skip = 0;
 #else
 #define FDBG(...)
 #endif
+// We have a real issue somewhere... exit.
+#define FPANIC(...) printf("[QEMU][!] " __VA_ARGS__); fflush(stdout); _exit(-1)
 
 #endif /* NO_FITM */
 
@@ -3614,9 +3625,7 @@ static abi_long do_sendrecvmsg_locked(int fd, struct target_msghdr *msgp,
 
         if (fd == FITM_FD)  {
             // TODO
-            fprintf(stderr, "[FITM] TODO: implement send(m)msg\n");
-            fflush(stderr);
-            exit(1);
+            FPANIC("TODO: implement send(m)msg\n");
             ret = 0;
             goto out;
         }
@@ -3643,9 +3652,7 @@ static abi_long do_sendrecvmsg_locked(int fd, struct target_msghdr *msgp,
 
         if (fd == FITM_FD)  {
             // TODO
-            fprintf(stderr, "[FITM] TODO: implement recv(m)msg\n");
-            fflush(stderr);
-            exit(1);
+            FPANIC("TODO: implement recv(m)msg\n");
             //ret = 0;
             //goto out;
         }
@@ -3963,8 +3970,7 @@ static abi_long do_sendto(int fd, abi_ulong msg, size_t len, int flags,
             return (abi_long)len;
         } else {
             if (fitm_out_fd == -1) {
-                printf("[FITM] BUG: fitm_out_fd not set in create_outputs!\n");
-                exit(-1);
+                FPANIC("BUG: fitm_out_fd not set in create_outputs!\n");
             }
             FDBG("Sendto called on FITM_FD -> writing to %d\n", fitm_out_fd);
             // TODO: proper guest2host conversation?
@@ -4016,8 +4022,7 @@ fail:
 
 static abi_long fitm_read(CPUState *cpu, int fd, char *msg, size_t len) {
     if (unlikely(fd != FITM_FD)) {
-        printf("[FITM] BUG: fitm_read may only be called with FITM_FD\n");
-        _exit(-1);
+        FPANIC("BUG: fitm_read may only be called with FITM_FD\n");
     }
     FDBG("fitm_read called from fitm fd %d for len %ld.\n", fd, len);
     fitm_ensure_initialized();
@@ -4069,18 +4074,14 @@ static abi_long fitm_read(CPUState *cpu, int fd, char *msg, size_t len) {
             // This would break the fitm snapshot restore
             close(2);
             if(block_signals()) {
-                printf("[QEMU] Could not block signals for do_criu call\n");
-                fflush(stdout);
-                _exit(-1);
+                FPANIC("Could not block signals for do_criu call\n");
             }
             do_criu();
             // Weird bug making criu restore crash - this solves it
             sleep(0.2);
             int stderr_fd = open("./stderr", O_WRONLY | O_APPEND);
             if (stderr_fd == -1) {
-                printf("[QEMU] Could not reopen stderr\n");
-                fflush(stdout);
-                _exit(-1);
+                FPANIC("Could not reopen stderr\n");
             }
             if (stderr_fd != 2) {
                 dup2(stderr_fd, 2);
@@ -4102,9 +4103,7 @@ static abi_long fitm_read(CPUState *cpu, int fd, char *msg, size_t len) {
             INC_AFL_AREA(loc);
 
             if (unlikely(fitm_in_file != NULL)) {
-                printf("[FITM] BUG: fitm_open_input_file called twice in one run\n");
-                fflush(stdout);
-                _exit(-1);
+                FPANIC("BUG: fitm_open_input_file called twice in one run\n");
             }
 
             fitm_in_file = fitm_open_input_file(input);
@@ -13389,6 +13388,7 @@ static abi_long do_syscall1(void *cpu_env, int num, abi_long arg1,
     {
         struct epoll_event ep;
         struct epoll_event *epp = 0;
+
         if (arg4) {
             if (arg2 != EPOLL_CTL_DEL) {
                 struct target_epoll_event *target_ep;
@@ -13403,6 +13403,7 @@ static abi_long do_syscall1(void *cpu_env, int num, abi_long arg1,
                  */
                 ep.data.u64 = tswap64(target_ep->data.u64);
                 unlock_user_struct(target_ep, arg4, 0);
+
             }
             /*
              * before kernel 2.6.9, EPOLL_CTL_DEL operation required a
@@ -13411,6 +13412,77 @@ static abi_long do_syscall1(void *cpu_env, int num, abi_long arg1,
              */
             epp = &ep;
         }
+
+        // If epoll is called for FITM_FD, we do the thing.
+        /*
+        [CREATE]
+            |
+          [EFD]
+            | < EPOLL_CTL
+        */
+
+        if (arg3 == FITM_FD) {
+            if (arg1 < 0) {
+                FDBG("EPOLL_CTL for negative efd %ld\n", arg1);
+                return -TARGET_EINVAL;
+            }
+            
+            if (ep.events & EPOLLEXCLUSIVE) {
+                FDBG("WARN: FITM_FD had EPOLLEXCLUSIVE set (we ignore this fact)\n");
+            }
+
+            FDBG("Epoll ctrl for FITM_FD\n");
+            if (arg2 == EPOLL_CTL_ADD) {
+                for (size_t i = 0; i < FITM_EPOLL_MAX; i++) {
+                    if (fitm_epoll_fd_ids[i] == -1) {
+                        FDBG("FITMized epoll fd %ld at pos %ld", arg1, i);
+                        // INSERT THE E_FD into the array   
+                        fitm_epoll_fd_ids[i] = arg1;
+                        fitm_epoll_events[i] = ep;
+                        if (i < FITM_EPOLL_MAX - 1) {
+                            fitm_epoll_fd_ids[i + 1] = -1;
+                        }
+                        return 0;
+                    } else if (fitm_epoll_fd_ids[i] == arg1) {
+                        return -TARGET_EEXIST;
+                    }
+                }
+                FPANIC("FTIM epoll_ctl called more than %d times! Increase FITM_EPOLL_MAX for this target!\n", FITM_EPOLL_MAX);
+
+            } else if (arg2 == EPOLL_CTL_MOD) {
+                for (size_t i = 0; i < FITM_EPOLL_MAX && fitm_epoll_fd_ids[i] != -1; i++) {
+                    if (fitm_epoll_fd_ids[i] == arg1) {
+                        fitm_epoll_events[i] = ep;
+                        return 0;
+                    }
+                }
+                return -TARGET_ENOENT;
+                
+            } else if (arg2 == EPOLL_CTL_DEL) {
+                int found = 0;
+                for (size_t i = 0; i < FITM_EPOLL_MAX && fitm_epoll_fd_ids[i] != -1; i++) {
+                    if (fitm_epoll_fd_ids[i] == arg1) {
+                        FDBG("Removed FITMized epoll fd %ld from pos %ld (shifting array)", arg1, i);
+                        fitm_epoll_fd_ids[i] = -1;
+                        found++;
+                    } else if (found) {
+                        // We shift ne next ocurrences forward
+                        fitm_epoll_fd_ids[i - found] = fitm_epoll_fd_ids[i];
+                        fitm_epoll_events[i - found] = fitm_epoll_events[i];
+                    }
+                }
+                if (!found) {
+                    return -TARGET_ENOENT;
+                } else if (found > 1) {
+                    FDBG("Deleted multiple entries for epoll fd %ld!\n", arg1);
+                }
+                return 0;
+            } else {
+                FDBG("Ignored FITM EPOLL_CTL with wrong op\n");
+                return -TARGET_EINVAL;
+            }
+        }
+
         return get_errno(epoll_ctl(arg1, arg2, arg3, epp));
     }
 #endif
@@ -13444,6 +13516,29 @@ static abi_long do_syscall1(void *cpu_env, int num, abi_long arg1,
             unlock_user(target_ep, arg2, 0);
             return -TARGET_ENOMEM;
         }
+
+        for (int i = 0; i < FITM_EPOLL_MAX && fitm_epoll_fd_ids[i] != -1; i++) {
+            // FITM Handling
+            if (fitm_epoll_fd_ids[i] == epfd) {
+                FDBG("Found FITMized epoll fd %d at pos %d\n", epfd, i);
+                target_ep[0].data.u64 = tswap64(fitm_epoll_events[i].data.u64);
+
+                int epoll_event_flags = 0;
+
+                if (!fitm_in_file) {
+                    FPANIC("Fitm file null in epoll :(\n");
+                }
+                if (feof(fitm_in_file)) {
+                    FDBG("EOF in epoll. We may (illegaly) have returned an 0 sized event before\n");
+                    epoll_event_flags = EPOLLHUP;
+                } else {
+                    epoll_event_flags = (EPOLLIN | EPOLLOUT) & fitm_epoll_events[i].events;
+                }
+                target_ep[0].events = tswap32(epoll_event_flags);
+                return 1;
+            }
+        }
+        FDBG("Epoll wait for non-FITMized efd %d\n", epfd);
 
         switch (num) {
 #if defined(TARGET_NR_epoll_pwait)
