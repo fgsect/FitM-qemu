@@ -143,6 +143,11 @@
 //#include <sys/stat.h>
 #include "qemuafl/fitm-criu.h"
 
+// If defined, completely disabled FITM (unless target accidentally uses fd 999)
+///#define FITM_DISABLED 1
+
+// if defined, fork-related intrumentation is disabled
+//#define FITM_NO_FORK 1
 
 // We originally used FD 0 to send input from afl into the target
 // However targets may use FD 0 to wait for an interrupt from the user or sth similar
@@ -3452,6 +3457,7 @@ static void fitm_ensure_initialized(void) {
 static abi_long do_socket(int domain, int type, int protocol)
 {
 
+#ifndef FITM_DISABLED
     if (domain == AF_INET || domain == AF_INET6) {
         fitm_ensure_initialized();
         if (!init_socket_skip) {
@@ -3476,6 +3482,7 @@ static abi_long do_socket(int domain, int type, int protocol)
         FDBG("Socket() called for non-inet protocol\n");
 
     }
+#endif /* FITM_DISABLED */
 
     int target_type = type;
     int ret;
@@ -3792,6 +3799,9 @@ static abi_long do_accept4(int fd, abi_ulong target_addr,
     */
 
     // Exit once we accepted once because we can only provide one input per fuzz child
+
+#ifndef FITM_DISABLED
+
     if (fitm_mode_started) {
         FDBG("Second accept after FITM started. Odd for some targets.\n");
 #ifdef FITM_ACCEPT_ONCE
@@ -3806,6 +3816,7 @@ static abi_long do_accept4(int fd, abi_ulong target_addr,
 
     return FITM_FD;
     // Ingoring all the rest after FITM
+#endif /* FITM_DISABLED */
 
     socklen_t addrlen, ret_addrlen;
     void *addr;
@@ -7022,7 +7033,7 @@ static int do_fork(CPUArchState *env, unsigned int flags, abi_ulong newsp,
             tb_flush(cpu);
         }
 
-
+#ifndef FITM_NO_FORK
         if (fitm_mode_started) {
             FDBG("do_fork(): fitm_mode_started. We don't clone anymore.\n");
             pthread_mutex_unlock(&info.mutex);
@@ -7044,7 +7055,9 @@ static int do_fork(CPUArchState *env, unsigned int flags, abi_ulong newsp,
             return 0;
 #endif
         }
+
         FDBG("do_fork(): pthread_create()\n");
+#endif /* FITM_NO_FORK */
 
         ret = pthread_create(&info.thread, &attr, clone_func, &info);
         /* TODO: Free new CPU state if thread creation failed.  */
@@ -7073,6 +7086,7 @@ static int do_fork(CPUArchState *env, unsigned int flags, abi_ulong newsp,
             return -TARGET_EINVAL;
         }
 
+#ifndef FITM_NO_FORK
         // Fake fork after we started the server
         if (fitm_mode_started) {
             FDBG("do_fork(): fitm_mode_started. We don't fork anymore.\n");
@@ -7084,6 +7098,7 @@ static int do_fork(CPUArchState *env, unsigned int flags, abi_ulong newsp,
             return 0;
     #endif
         }
+#endif
 
 
         if (block_signals()) {
@@ -7091,6 +7106,7 @@ static int do_fork(CPUArchState *env, unsigned int flags, abi_ulong newsp,
         }
 
         fork_start();
+#ifndef FITM_NO_FORK
         if (fitm_mode_started) {
             FDBG("FitM mode fork end\n");
             ret = 0;
@@ -7099,6 +7115,9 @@ static int do_fork(CPUArchState *env, unsigned int flags, abi_ulong newsp,
             FDBG("Non-FitM fork\n");
             ret = fork();
         }
+#else
+        ret = fork();
+#endif
         if (ret == 0) {
             /* Child Process.  */
             cpu_clone_regs_child(env, newsp, flags);
