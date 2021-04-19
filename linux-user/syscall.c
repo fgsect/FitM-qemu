@@ -3457,10 +3457,10 @@ static abi_long do_socket(int domain, int type, int protocol)
         if (!init_socket_skip) {
 
             if (single_socket == SINGLE_SOCKET_TRIGGERED) {
-                FDBG("Socket() called again in SINGLE_SOCKET mode - not FITMizing.");
+                FDBG("Socket() called again in SINGLE_SOCKET mode - not FITMizing.\n");
             } else {
                 if (single_socket == SINGLE_SOCKET_ENABLED) {
-                    FDBG("Socket() triggered the first time in SINGLE_SOCKET mode. FITMizing.");
+                    FDBG("Socket() triggered the first time in SINGLE_SOCKET mode. FITMizing.\n");
                     single_socket = SINGLE_SOCKET_TRIGGERED;
                 }
                 FDBG("do_socket: returning FITM_FD\n");
