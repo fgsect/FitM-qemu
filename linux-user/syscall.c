@@ -13465,7 +13465,7 @@ static abi_long do_syscall1(void *cpu_env, int num, abi_long arg1,
             if (arg2 == EPOLL_CTL_ADD) {
                 for (size_t i = 0; i < FITM_EPOLL_MAX; i++) {
                     if (fitm_epoll_fd_ids[i] == -1) {
-                        FDBG("FITMized epoll fd %ld at pos %ld", arg1, i);
+                        FDBG("FITMized epoll fd %ld at pos %ld\n", arg1, i);
                         // INSERT THE E_FD into the array   
                         fitm_epoll_fd_ids[i] = arg1;
                         fitm_epoll_events[i] = ep;
@@ -13495,7 +13495,7 @@ static abi_long do_syscall1(void *cpu_env, int num, abi_long arg1,
                 int found = 0;
                 for (size_t i = 0; i < FITM_EPOLL_MAX && fitm_epoll_fd_ids[i] != -1; i++) {
                     if (fitm_epoll_fd_ids[i] == arg1) {
-                        FDBG("Removed FITMized epoll fd %ld from pos %ld (shifting array)", arg1, i);
+                        FDBG("Removed FITMized epoll fd %ld from pos %ld (shifting array)\n", arg1, i);
                         fitm_epoll_fd_ids[i] = -1;
                         found++;
                     } else if (found) {
