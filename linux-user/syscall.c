@@ -9500,7 +9500,7 @@ static abi_long do_syscall1(void *cpu_env, int num, abi_long arg1,
             FDBG("dup returning FITM_FD\n");
             // just return the same fd again. May work.
             return FITM_FD;
-        }        
+        }
         ret = get_errno(dup(arg1));
         if (ret >= 0) {
             fd_trans_dup(arg1, ret);
@@ -9570,6 +9570,14 @@ static abi_long do_syscall1(void *cpu_env, int num, abi_long arg1,
         return ret;
 #ifdef TARGET_NR_dup2
     case TARGET_NR_dup2:
+        if (arg1 == FITM_FD || arg2 == FITM_FD) {
+            // Dupping to fitm_fd would be okay in theory, but why bother?
+            // to properly handle dup2 for fitm_fd, we'd need to keep track of fitm-ized fds.
+            // It'd be slow (and we don't want to be slow for fuzzing.)
+            // It's better to nop out that code from your target.
+            FPANIC("DUP2 on FITM_FD :( Not much we can do! (arg1 %ld, arg2 %ld)\n", arg1, arg2);
+        }
+
         ret = get_errno(dup2(arg1, arg2));
         if (ret >= 0) {
             fd_trans_dup(arg1, arg2);
