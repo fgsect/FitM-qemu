@@ -152,6 +152,8 @@
 // Use this define to toggle debug prints in various places
 // Might be spammy
 #define FITM_DEBUG 1
+// If -1: don't restrict to ports, if set otherwise, will only FITMize the given port.
+#define FITM_PORT -1
 // Remove FITM_FAST_EXIT if you want an orderly exit of the target
 #define FITM_FAST_EXIT 1
 // Remove this define temporarily to ignore do_criu() calls
@@ -211,6 +213,14 @@ static int init_recv_skip = 0;
 /// Allows the first `n` socket calls to return a proper socket.
 /// Needed for example for getifaddr in libc to function properly.
 static int init_socket_skip = 0;
+
+enum single_socket_state {
+    SINGLE_SOCKET_DISABLED,
+    SINGLE_SOCKET_ENABLED,
+    SINGLE_SOCKET_TRIGGERED,
+};
+/// Only fitm-ize one socket() call (after init_socket_skip).
+static enum single_socket_state single_socket = SINGLE_SOCKET_DISABLED;
 
 // FITM specific: for debug prints, use FDBG.
 #ifdef FITM_DEBUG
@@ -3399,15 +3409,19 @@ static void fitm_ensure_initialized(void) {
 
         if (count_recvs){
             // Ignore any possible error
-            char* init_recv_skip_tmp = getenv_from_file("INIT_RECV_SKIP");
-            if(init_recv_skip_tmp){
+            char *init_recv_skip_tmp = getenv_from_file("INIT_RECV_SKIP");
+            if (init_recv_skip_tmp) {
                 init_recv_skip = atoi(init_recv_skip_tmp);
                 FDBG("read init_recv_skip with %d\n", init_recv_skip);
             }
-            char* init_socket_skip_tmp = getenv_from_file("INIT_SOCKET_SKIP");
-            if(init_socket_skip_tmp){
+            char *init_socket_skip_tmp = getenv_from_file("INIT_SOCKET_SKIP");
+            if (init_socket_skip_tmp) {
                 init_socket_skip = atoi(init_socket_skip_tmp);
                 FDBG("read init_socket_skip with %d\n", init_socket_skip);
+            }
+            char *single_socket_tmp = getenv_from_file("SINGLE_SOCKET");
+            if (single_socket_tmp && *single_socket_tmp && *single_socket_tmp != '0') {
+                single_socket = SINGLE_SOCKET_ENABLED;
             }
         }
 
@@ -3442,8 +3456,16 @@ static abi_long do_socket(int domain, int type, int protocol)
         fitm_ensure_initialized();
         if (!init_socket_skip) {
 
-            FDBG("do_socket: returning FITM_FD\n");
-            return FITM_FD;
+            if (single_socket == SINGLE_SOCKET_TRIGGERED) {
+                FDBG("Socket() called again in SINGLE_SOCKET mode - not FITMizing.");
+            } else {
+                if (single_socket == SINGLE_SOCKET_ENABLED) {
+                    FDBG("Socket() triggered the first time in SINGLE_SOCKET mode. FITMizing.");
+                    single_socket = SINGLE_SOCKET_TRIGGERED;
+                }
+                FDBG("do_socket: returning FITM_FD\n");
+                return FITM_FD;
+            }
 
         } else {
             init_socket_skip--;
@@ -13444,7 +13466,10 @@ static abi_long do_syscall1(void *cpu_env, int num, abi_long arg1,
                         }
                         return 0;
                     } else if (fitm_epoll_fd_ids[i] == arg1) {
-                        return -TARGET_EEXIST;
+                        // The target may be managing multiple FITM FDs, which is fine for us.
+                        // return -TARGET_EEXIST;
+                        FDBG("FITM_FD already registered for epoll fd %ld\n", arg1);
+                        return 0;
                     }
                 }
                 FPANIC("FTIM epoll_ctl called more than %d times! Increase FITM_EPOLL_MAX for this target!\n", FITM_EPOLL_MAX);
