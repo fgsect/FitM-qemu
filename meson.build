@@ -2229,12 +2229,20 @@ foreach target : target_dirs
     endif
 
     # For FITM: Find criu as dependency.
-    criu_dep = dependency('criu')
+    #criu_dep = dependency('criu')
+    #cc.find_library('criu', required: true)
+    #criu_dep = declare_dependency(link_args : ['-L../../../criu/lib/c', '-lcriu'],
+    #                           include_directories : ['../../../criu/include'])
+    protobuf_dep = dependency('libprotobuf-c')
+    criu_dep = cc.find_library('criu', required: true, dirs: [meson.current_source_dir() / '../../criu/lib/c'], static: true)
+    criu_inc = include_directories(['../../../criu/include'])
+    
 
     emulator = executable(exe_name, exe['sources'],
                install: true,
                c_args: c_args,
-               dependencies: arch_deps + deps + [criu_dep] + exe['dependencies'],
+               dependencies: arch_deps + deps + [criu_dep, protobuf_dep] + exe['dependencies'],
+               include_directories: criu_inc,
                objects: lib.extract_all_objects(recursive: true),
                link_language: link_language,
                link_depends: [block_syms, qemu_syms] + exe.get('link_depends', []),
