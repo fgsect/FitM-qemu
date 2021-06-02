@@ -147,7 +147,7 @@
 ///#define FITM_DISABLED 1
 
 // if defined, fork-related intrumentation is disabled
-//#define FITM_NO_FORK 1
+#define FITM_NO_FORK 1
 
 // We originally used FD 0 to send input from afl into the target
 // However targets may use FD 0 to wait for an interrupt from the user or sth similar
@@ -169,6 +169,9 @@
 #define INCLUDE_DOCRIU 1
 // The next receive after send should create a snapshot
 // Idea is: We're waiting for a return from the other side then
+
+// What to return if ioctl is called on FITM_FD
+#define FITM_IOCTL_RETURN 0
 
 // If undefined, contines in the parent instead.
 #define FITM_FORK_FOLLOW_CHILD 1
@@ -6297,6 +6300,12 @@ IOCTLEntry ioctl_entries[] = {
 /* do_ioctl() Must return target values and target errnos. */
 static abi_long do_ioctl(int fd, int cmd, abi_long arg)
 {
+
+    if (fd == FITM_FD) {
+        FDBG("IOCTL with cmd %d called on FITM_FD -> returning %d\n", cmd, FITM_IOCTL_RETURN);
+        return FITM_IOCTL_RETURN;
+    }
+
     const IOCTLEntry *ie;
     const argtype *arg_type;
     abi_long ret;
@@ -7047,7 +7056,7 @@ static int do_fork(CPUArchState *env, unsigned int flags, abi_ulong newsp,
 #ifdef FITM_FORK_FOLLOW_CHILD
 
             // should never return from this call
-            FDBG("Returning from clone as parent\n");
+            FDBG("Returning from clone as child\n");
             clone_func(&info);
 
             fprintf(stderr, "This should be dead code\n");
