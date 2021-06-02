@@ -159,8 +159,11 @@
 #define FITM_DEBUG 1
 // If -1: don't restrict to ports, if set otherwise, will only FITMize the given port.
 #define FITM_PORT -1
-// Remove FITM_FAST_EXIT if you want an orderly exit of the target
-#define FITM_FAST_EXIT 1
+
+// Remove FITM_FAST_EXIT if you want an orderly exit of the target.
+// CAUTION! FAST_EXIT calls exit_group early on multithreaded targets (by design)!
+//#define FITM_FAST_EXIT 1
+
 // Remove this define temporarily to ignore do_criu() calls
 // This might be useful when debugging targets where a specific behaviour is solicited after a snapshot
 #define INCLUDE_DOCRIU 1
@@ -8837,17 +8840,18 @@ static abi_long do_syscall1(void *cpu_env, int num, abi_long arg1,
            and _exit_group is used for application termination.
            Do thread termination if we have more then one thread.  */
 
-        // More forceful exit
+        FDBG("exit: Target tried to exit with exitcode %ld\n", arg1);
         if ((arg1 & 0xFF) == 42) {
             printf( "Target tried to exit with reseved exit code (42).\n"
                     "Reserved for criu-snapshots: \"qemu/qemu/linux-user/criu.h\"\n");
-            fflush(stdout);
-            _exit(43);
+            num = 43;
         }
-        FDBG("exit: Target tried to exit with exitcode %ld\n", arg1);
 #ifdef FITM_FAST_EXIT
-        arg1 = 0;
-        _exit(arg1);
+        // More forceful exit if we're already running.
+        if (fitm_in_file) {
+            arg1 = 0;
+            _exit(arg1);
+        }
 #endif
 
         if (block_signals()) {
