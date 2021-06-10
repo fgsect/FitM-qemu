@@ -173,6 +173,9 @@
 // The next receive after send should create a snapshot
 // Idea is: We're waiting for a return from the other side then
 
+/// Exit after all fuzzing input has been read (?)
+/// #define FITM_EXIT_AFTER_FUZZING_INPUT 1
+
 // What to return if ioctl is called on FITM_FD
 #define FITM_IOCTL_RETURN 0
 
@@ -3603,8 +3606,124 @@ static abi_long do_connect(int sockfd, abi_ulong target_addr,
     return get_errno(safe_connect(sockfd, addr, addrlen));
 }
 
+
+static abi_long fitm_read(CPUState *cpu, int fd, char *msg, size_t len) {
+    if (unlikely(fd != FITM_FD)) {
+        FPANIC("BUG: fitm_read may only be called with FITM_FD\n");
+    }
+    FDBG("fitm_read called from fitm fd %d for len %ld.\n", fd, len);
+    fitm_ensure_initialized();
+
+    // Read is always nice to reach.
+    size_t loc = AFL_MAP_READ;
+    INC_AFL_AREA(loc);
+
+
+    // If we sent something, and hit the next recv, either snapshot, or exit.
+    if(fitm_sent || unlikely(!fitm_in_file)) {
+
+        if (init_recv_skip > 0) {
+            init_recv_skip -= 1;
+            FDBG("fitm_read: skipping recv by returning empty string\n");
+            return 0;
+        }
+
+        if (fitm_replay) {
+            char* input = getenv_from_file("INPUT_FILENAME");
+            fitm_in_file = fitm_open_input_file(input);
+        } else if (!timewarp_mode) {
+            FDBG("we are done here. Have a nice day.\n");
+            _exit(0);
+        } else if (timewarp_mode){
+            count_recvs = false;
+            fitm_sent = false; // After restore, we'll await the next sent before criuin' again
+
+            // We reached our goal! :)
+            loc = AFL_MAP_READ + 1;
+            INC_AFL_AREA(loc);
+
+            create_pipes_file();
+
+            if (fitm_out_fd != -1) {
+                FDBG("Create Outputs in Snapshot run (?)\n");
+                close(fitm_out_fd);
+            }
+
+            if (fitm_in_file) {
+                // close the last in file, ready for the next round.
+                fclose(fitm_in_file);
+                // if we don't set this manually, checking fitm_in_file for NULL goes tuttikaputti
+                fitm_in_file = NULL;
+            }
+
+#ifdef INCLUDE_DOCRIU
+            // We close stdout and err as QEMU Strace will write to the stream after the snapshot.
+            // This would break the fitm snapshot restore
+            close(2);
+            if(block_signals()) {
+                FPANIC("Could not block signals for do_criu call\n");
+            }
+            do_criu();
+            // Weird bug making criu restore crash - this solves it
+            sleep(0.2);
+            int stderr_fd = open("./stderr", O_WRONLY | O_APPEND);
+            if (stderr_fd == -1) {
+                FPANIC("Could not reopen stderr\n");
+            }
+            if (stderr_fd != 2) {
+                dup2(stderr_fd, 2);
+                close(stderr_fd);
+            }
+            fprintf(stderr, "\n=== CRIU RESTORED ===\n");
+#endif
+            // If we don't unset here fitm_output_fd is never set since env_init is set to true before the snapshot and never unset
+            env_init = false;
+
+            char* input = getenv_from_file("INPUT_FILENAME");
+
+            fitm_ensure_initialized();
+
+            spawn_forksrv(cpu, timewarp_mode);
+
+            // Make sure all maps contain something, so cmin doesn't kill 'em
+            loc = AFL_MAP_READ + 2;
+            INC_AFL_AREA(loc);
+
+            if (unlikely(fitm_in_file != NULL)) {
+                FPANIC("BUG: fitm_open_input_file called twice in one run\n");
+            }
+
+            fitm_in_file = fitm_open_input_file(input);
+        }
+    }
+
+    int ret = fread(msg, 1, len, fitm_in_file);
+    if (ret == -1 && errno == EBADF) {
+        printf("[QEMU] bug: read on closed FITM_FD?\n");
+        perror("FD 1337");
+        fflush(stdout);
+        _exit(-1);
+    } else if (ret == 0) {
+        // Some targets may sleep after the server disconnected.
+        // We lose bugs in teardown code but fuzzing works
+        printf("[QEMU] No more fuzzing input.");
+#ifdef FITM_EXIT_AFTER_FUZZING_INPUT
+        printf(".. exiting now.\n");
+        fflush(stdout);
+        // FOR FTP USE THIS:
+         _exit(0);
+#else
+        printf("\n");
+        return 0;
+#endif
+    };
+    FDBG("read: %d bytes with msg: %s\n", ret, msg);
+    // TODO: We completely ignore changes in endianness (get_errno et al. could be used)
+    return ret;
+}
+
 /* do_sendrecvmsg_locked() Must return target values and target errnos. */
-static abi_long do_sendrecvmsg_locked(int fd, struct target_msghdr *msgp,
+static abi_long do_sendrecvmsg_locked(CPUState *cpu, int fd, struct target_msghdr *msgp,
                                       int flags, int send)
 {
     abi_long ret, len;
@@ -3662,9 +3781,39 @@ static abi_long do_sendrecvmsg_locked(int fd, struct target_msghdr *msgp,
     if (send) {
 
         if (fd == FITM_FD)  {
-            // TODO
-            FDBG("TODO: implement send(m)msg\n");
+
+            if (msg.msg_iovlen < 1) {
+                FDBG("[!] send(m)msg: 0 bytes written to FITM_FD\n");
+                ret = 0;
+                goto out;
+            }
+
+            if (msg.msg_controllen) {
+                FDBG("[!] send(m)msg: Ignored control characters of len %d on FITM_FD\n", msg.msg_controllen);
+            }
+            
+            if (!create_outputs || fitm_out_fd == -1) {
+                FDBG("Skipping outpus in send(m)msg for FITM_FD\n");
+                ret = 0;
+                goto out;
+            }
+
+            FDBG("Handling sendmsg with iovlen %ld\n", msg.msg_iovlen);
             ret = 0;
+            for (int i = 0; i < msg.msg_iovlen; i++) {
+                ssize_t written = 0;
+                while (written < msg.msg_iov[i].iov_len) {
+                    ssize_t write_result = write(fitm_out_fd, msg.msg_iov[i].iov_base + written, msg.msg_iov[i].iov_len - written);
+                    if (write_result < 0) {
+                        FDBG("send(m)msg: Failed to write %ld bytes\n", msg.msg_iov[i].iov_len);
+                        ret += written;
+                        goto out;
+                    }
+                    written += write_result;
+                }
+                ret += written
+                FDBG("send(m)msg sent %ld bytes.\n", ret);
+            }
             goto out;
         }
 
@@ -3689,10 +3838,17 @@ static abi_long do_sendrecvmsg_locked(int fd, struct target_msghdr *msgp,
     } else {
 
         if (fd == FITM_FD)  {
-            // TODO
-            FDBG("TODO: implement recv(m)msg\n");
+
+            if (msg.msg_iovlen < 1) {
+                FDBG("[!] recv(m)msg called with 0 iov elements. Returning 0.\n");
+                ret = 0;
+                goto out;
+            }
+
+            FDBG("Handling recvmmsg with iovlen %ld and first buf len of %ld bytes\n", msg.msg_iovlen, msg.msg_iov->iov_len);
+
+            ret = fitm_read(cpu, 999, msg.msg_iov->iov_base, msg.msg_iov->iov_len);
             // 0 -> client did an orderly shutdown;
-            ret = 0;
             goto out;
         }
 
@@ -3727,7 +3883,7 @@ out2:
     return ret;
 }
 
-static abi_long do_sendrecvmsg(int fd, abi_ulong target_msg,
+static abi_long do_sendrecvmsg(CPUState *cpu, int fd, abi_ulong target_msg,
                                int flags, int send)
 {
     abi_long ret;
@@ -3739,7 +3895,7 @@ static abi_long do_sendrecvmsg(int fd, abi_ulong target_msg,
                           send ? 1 : 0)) {
         return -TARGET_EFAULT;
     }
-    ret = do_sendrecvmsg_locked(fd, msgp, flags, send);
+    ret = do_sendrecvmsg_locked(cpu, fd, msgp, flags, send);
     unlock_user_struct(msgp, target_msg, send ? 0 : 1);
     return ret;
 }
@@ -3751,7 +3907,7 @@ static abi_long do_sendrecvmsg(int fd, abi_ulong target_msg,
 #define MSG_WAITFORONE 0x10000
 #endif
 
-static abi_long do_sendrecvmmsg(int fd, abi_ulong target_msgvec,
+static abi_long do_sendrecvmmsg(CPUState *cpu, int fd, abi_ulong target_msgvec,
                                 unsigned int vlen, unsigned int flags,
                                 int send)
 {
@@ -3769,7 +3925,7 @@ static abi_long do_sendrecvmmsg(int fd, abi_ulong target_msgvec,
     }
 
     for (i = 0; i < vlen; i++) {
-        ret = do_sendrecvmsg_locked(fd, &mmsgp[i].msg_hdr, flags, send);
+        ret = do_sendrecvmsg_locked(cpu, fd, &mmsgp[i].msg_hdr, flags, send);
         if (is_error(ret)) {
             break;
         }
@@ -4063,114 +4219,6 @@ fail:
 
 
 
-static abi_long fitm_read(CPUState *cpu, int fd, char *msg, size_t len) {
-    if (unlikely(fd != FITM_FD)) {
-        FPANIC("BUG: fitm_read may only be called with FITM_FD\n");
-    }
-    FDBG("fitm_read called from fitm fd %d for len %ld.\n", fd, len);
-    fitm_ensure_initialized();
-
-    // Read is always nice to reach.
-    size_t loc = AFL_MAP_READ;
-    INC_AFL_AREA(loc);
-
-
-    // If we sent something, and hit the next recv, either snapshot, or exit.
-    if(fitm_sent || unlikely(!fitm_in_file)) {
-
-        if (init_recv_skip > 0) {
-            init_recv_skip -= 1;
-            FDBG("fitm_read: skipping recv by returning empty string\n");
-            return 0;
-        }
-
-        if (fitm_replay) {
-            char* input = getenv_from_file("INPUT_FILENAME");
-            fitm_in_file = fitm_open_input_file(input);
-        } else if (!timewarp_mode) {
-            FDBG("we are done here. Have a nice day.\n");
-            _exit(0);
-        } else if (timewarp_mode){
-            count_recvs = false;
-            fitm_sent = false; // After restore, we'll await the next sent before criuin' again
-
-            // We reached our goal! :)
-            loc = AFL_MAP_READ + 1;
-            INC_AFL_AREA(loc);
-
-            create_pipes_file();
-
-            if (fitm_out_fd != -1) {
-                FDBG("Create Outputs in Snapshot run (?)\n");
-                close(fitm_out_fd);
-            }
-
-            if (fitm_in_file) {
-                // close the last in file, ready for the next round.
-                fclose(fitm_in_file);
-                // if we don't set this manually, checking fitm_in_file for NULL goes tuttikaputti
-                fitm_in_file = NULL;
-            }
-
-#ifdef INCLUDE_DOCRIU
-            // We close stdout and err as QEMU Strace will write to the stream after the snapshot.
-            // This would break the fitm snapshot restore
-            close(2);
-            if(block_signals()) {
-                FPANIC("Could not block signals for do_criu call\n");
-            }
-            do_criu();
-            // Weird bug making criu restore crash - this solves it
-            sleep(0.2);
-            int stderr_fd = open("./stderr", O_WRONLY | O_APPEND);
-            if (stderr_fd == -1) {
-                FPANIC("Could not reopen stderr\n");
-            }
-            if (stderr_fd != 2) {
-                dup2(stderr_fd, 2);
-                close(stderr_fd);
-            }
-            fprintf(stderr, "\n=== CRIU RESTORED ===\n");
-#endif
-            // If we don't unset here fitm_output_fd is never set since env_init is set to true before the snapshot and never unset
-            env_init = false;
-
-            char* input = getenv_from_file("INPUT_FILENAME");
-
-            fitm_ensure_initialized();
-
-            spawn_forksrv(cpu, timewarp_mode);
-
-            // Make sure all maps contain something, so cmin doesn't kill 'em
-            loc = AFL_MAP_READ + 2;
-            INC_AFL_AREA(loc);
-
-            if (unlikely(fitm_in_file != NULL)) {
-                FPANIC("BUG: fitm_open_input_file called twice in one run\n");
-            }
-
-            fitm_in_file = fitm_open_input_file(input);
-        }
-    }
-
-    int ret = fread(msg, 1, len, fitm_in_file);
-    if (ret == -1 && errno == EBADF) {
-        printf("[QEMU] bug: read on closed FITM_FD?\n");
-        perror("FD 1337");
-        fflush(stdout);
-        _exit(-1);
-    } else if (ret == 0) {
-        // Some targets may sleep after the server disconnected.
-        // We lose bugs in teardown code but fuzzing works
-        printf("[QEMU] No more fuzzing input. Exiting now.\n");
-        fflush(stdout);
-        // FOR FTP USE THIS:
-         _exit(0);
-    };
-    FDBG("read: %d bytes with msg: %s\n", ret, msg);
-    // TODO: We completely ignore changes in endianness (get_errno et al. could be used)
-    return ret;
-}
 
 
 /* do_recvfrom() Must return target values and target errnos. */
@@ -10624,7 +10672,7 @@ static abi_long do_syscall1(void *cpu_env, int num, abi_long arg1,
 #endif
 #ifdef TARGET_NR_recvmsg
     case TARGET_NR_recvmsg:
-        return do_sendrecvmsg(arg1, arg2, arg3, 0);
+        return do_sendrecvmsg(cpu, arg1, arg2, arg3, 0);
 #endif
 #ifdef TARGET_NR_send
     case TARGET_NR_send:
@@ -10632,15 +10680,15 @@ static abi_long do_syscall1(void *cpu_env, int num, abi_long arg1,
 #endif
 #ifdef TARGET_NR_sendmsg
     case TARGET_NR_sendmsg:
-        return do_sendrecvmsg(arg1, arg2, arg3, 1);
+        return do_sendrecvmsg(cpu, arg1, arg2, arg3, 1);
 #endif
 #ifdef TARGET_NR_sendmmsg
     case TARGET_NR_sendmmsg:
-        return do_sendrecvmmsg(arg1, arg2, arg3, arg4, 1);
+        return do_sendrecvmmsg(cpu, arg1, arg2, arg3, arg4, 1);
 #endif
 #ifdef TARGET_NR_recvmmsg
     case TARGET_NR_recvmmsg:
-        return do_sendrecvmmsg(arg1, arg2, arg3, arg4, 0);
+        return do_sendrecvmmsg(cpu, arg1, arg2, arg3, arg4, 0);
 #endif
 #ifdef TARGET_NR_sendto
     case TARGET_NR_sendto:
