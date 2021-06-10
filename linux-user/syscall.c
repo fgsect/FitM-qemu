@@ -156,7 +156,7 @@
 #define FITM_FD 999
 // Use this define to toggle debug prints in various places
 // Might be spammy
-#define FITM_DEBUG 1
+// #define FITM_DEBUG 1
 // If -1: don't restrict to ports, if set otherwise, will only FITMize the given port.
 #define FITM_PORT -1
 
