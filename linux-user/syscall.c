@@ -149,6 +149,9 @@
 // if defined, fork-related intrumentation is disabled
 #define FITM_NO_FORK 1
 
+// completely disables wait() on futex
+//#define FITM_NO_MUTEX 1
+
 // We originally used FD 0 to send input from afl into the target
 // However targets may use FD 0 to wait for an interrupt from the user or sth similar
 // Since using fitm_in_file we need to set FITM_FD to the current FD value
@@ -8136,10 +8139,12 @@ static int do_sys_futex(int *uaddr, int op, int val,
                          const struct timespec *timeout, int *uaddr2,
                          int val3)
 {
+#ifdef FITM_NO_MUTEX
     if (op & FUTEX_WAIT) {
         FDBG("FITM: FUTEX_WAIT happened. Returning 0\n");
         return 0;
     }
+#endif
 
 #if HOST_LONG_BITS == 64
 #if defined(__NR_futex)
