@@ -3895,7 +3895,7 @@ static abi_long do_getpeername(int fd, abi_ulong target_addr,
         addr_pointer->sa_data[4] = 0;
         addr_pointer->sa_data[5] = 42;
 
-        ret = 0;
+        ret = 4;
     } else {
         FDBG("getpeername() called on non-fitm fd\n");
 
