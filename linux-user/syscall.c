@@ -8136,6 +8136,11 @@ static int do_sys_futex(int *uaddr, int op, int val,
                          const struct timespec *timeout, int *uaddr2,
                          int val3)
 {
+    if (op & FUTEX_WAIT) {
+        FDBG("FITM: FUTEX_WAIT happened. Returning 0\n");
+        return 0;
+    }
+
 #if HOST_LONG_BITS == 64
 #if defined(__NR_futex)
     /* always a 64-bit time_t, it doesn't define _time64 version  */
@@ -13538,10 +13543,12 @@ static abi_long do_syscall1(void *cpu_env, int num, abi_long arg1,
                     }
                 }
                 if (!found) {
+                    FDBG("Tried to remove FITMized epoll fd %ld, but it was not found in epoll_fd_ids!\n", arg1);
                     return -TARGET_ENOENT;
                 } else if (found > 1) {
                     FDBG("Deleted multiple entries for epoll fd %ld!\n", arg1);
                 }
+                FDBG("Returning regularly from FITM EPOLL_DEL\n");
                 return 0;
             } else {
                 FDBG("Ignored FITM EPOLL_CTL with wrong op\n");
