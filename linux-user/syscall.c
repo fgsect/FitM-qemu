@@ -3660,7 +3660,7 @@ static abi_long do_sendrecvmsg_locked(int fd, struct target_msghdr *msgp,
 
         if (fd == FITM_FD)  {
             // TODO
-            FPANIC("TODO: implement send(m)msg\n");
+            FDBG("TODO: implement send(m)msg\n");
             ret = 0;
             goto out;
         }
@@ -3687,9 +3687,10 @@ static abi_long do_sendrecvmsg_locked(int fd, struct target_msghdr *msgp,
 
         if (fd == FITM_FD)  {
             // TODO
-            FPANIC("TODO: implement recv(m)msg\n");
-            //ret = 0;
-            //goto out;
+            FDBG("TODO: implement recv(m)msg\n");
+            // 0 -> client did an orderly shutdown;
+            ret = 0;
+            goto out;
         }
 
         ret = get_errno(safe_recvmsg(fd, &msg, flags));
@@ -13590,13 +13591,14 @@ static abi_long do_syscall1(void *cpu_env, int num, abi_long arg1,
 
                 int epoll_event_flags = 0;
 
-                if (!fitm_in_file) {
-                    FPANIC("Fitm file null in epoll :(\n");
-                }
-                if (feof(fitm_in_file)) {
+                
+                if (fitm_in_file && feof(fitm_in_file)) {
                     FDBG("EOF in epoll. We may (illegaly) have returned an 0 sized event before\n");
                     epoll_event_flags = EPOLLHUP;
                 } else {
+                    if (!fitm_in_file) {
+                        FDBG("Called epoll on FITM_FD before first occurance of fitm_read\n");
+                    }
                     epoll_event_flags = (EPOLLIN | EPOLLOUT) & fitm_epoll_events[i].events;
                 }
                 target_ep[0].events = tswap32(epoll_event_flags);

@@ -144,6 +144,25 @@ static int do_criu(void){
     struct criu_opts *criu_request_options = NULL;
 
     char *snapshot_dir = getenv_from_file("CRIU_SNAPSHOT_OUT_DIR");
+
+    /*
+    // Shell injection for free :)
+
+    if (!snapshot_dir || strlen(snapshot_dir) <= 1) {
+        printf("Oof, very small or non-existant snapshot dir. Exiting\n");
+        _exit(1);
+    }
+
+    const char *rmrf = "rm -rf %s";
+    char buf[PATH_MAX + sizeof(rmrf)];
+    snprintf(buf, sizeof(buf) - 1, rmrf, snapshot_dir);
+    buf[sizeof(buf) -1 ] = '\0';
+    (void) !system(buf);
+
+    sync();
+    mkdir(snapshot_dir, 0777);
+    */
+
     printf("fitm-criu.h: snapshot_dir %s\n", snapshot_dir);
     dir_fd = open(snapshot_dir, O_DIRECTORY);
     if (dir_fd == -1) {
@@ -166,11 +185,14 @@ static int do_criu(void){
 
     criu_local_set_images_dir_fd(criu_request_options, dir_fd);
     criu_local_set_log_level(criu_request_options, 4);
-    criu_local_set_leave_running(criu_request_options, true);
+    criu_local_set_leave_running(criu_request_options, false);
 
     // We need to flush everything, else we have a slight chance that files change after dump.
     fflush(stdout);
     fflush(stderr);
+    fsync(fileno(stdout));
+    fsync(fileno(stderr));
+    sync();
 
     int criu_result = criu_local_dump(criu_request_options);
 
