@@ -194,6 +194,9 @@ static int do_criu(void){
     fsync(fileno(stderr));
     sync();
 
+    // This returns <0 if there is an error.
+    // If the process is restored it returns with 1.
+    // If the process is dumped we don't return because "criu_local_set_leave_running" is set to false.
     int criu_result = criu_local_dump(criu_request_options);
 
     if (criu_result < 0) {
@@ -202,14 +205,6 @@ static int do_criu(void){
         goto exit;
     }
     
-    if (criu_result == 0) {
-        // SIGNAL INIT
-
-        /* We exit with 42 upon a successful snapshot-exit
-        The returncode is checked in snapshot_run to determine 
-        whether a new checkpoint was reached */
-        _exit(SNAP_SUCCESS_EXIT);
-    }
 
     if (criu_result == 1) {
         printf("RESTORED\n");

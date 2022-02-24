@@ -159,7 +159,7 @@
 #define FITM_FD 999
 // Use this define to toggle debug prints in various places
 // Might be spammy
-// #define FITM_DEBUG 1
+#define FITM_DEBUG 1
 // If -1: don't restrict to ports, if set otherwise, will only FITMize the given port.
 #define FITM_PORT -1
 
@@ -3811,7 +3811,7 @@ static abi_long do_sendrecvmsg_locked(CPUState *cpu, int fd, struct target_msghd
                     }
                     written += write_result;
                 }
-                ret += written
+                ret += written;
                 FDBG("send(m)msg sent %ld bytes.\n", ret);
             }
             goto out;
@@ -12062,6 +12062,10 @@ static abi_long do_syscall1(void *cpu_env, int num, abi_long arg1,
 #ifdef TARGET_NR_newfstatat
     case TARGET_NR_newfstatat:
 #endif
+        if (arg1 == 999){ 
+            FDBG("Handling newfstatat(): return 0\n");
+            return 0;
+        }
         if (!(p = lock_user_string(arg2))) {
             return -TARGET_EFAULT;
         }
