@@ -147,7 +147,7 @@
 ///#define FITM_DISABLED 1
 
 // if defined, fork-related intrumentation is disabled
-#define FITM_NO_FORK 1
+// #define FITM_NO_FORK 1
 
 // completely disables wait() on futex
 //#define FITM_NO_MUTEX 1
@@ -165,7 +165,7 @@
 
 // Remove FITM_FAST_EXIT if you want an orderly exit of the target.
 // CAUTION! FAST_EXIT calls exit_group early on multithreaded targets (by design)!
-//#define FITM_FAST_EXIT 1
+#define FITM_FAST_EXIT 1
 
 // Remove this define temporarily to ignore do_criu() calls
 // This might be useful when debugging targets where a specific behaviour is solicited after a snapshot
@@ -174,7 +174,7 @@
 // Idea is: We're waiting for a return from the other side then
 
 /// Exit after all fuzzing input has been read (?)
-/// #define FITM_EXIT_AFTER_FUZZING_INPUT 1
+#define FITM_EXIT_AFTER_FUZZING_INPUT 1
 
 // What to return if ioctl is called on FITM_FD
 #define FITM_IOCTL_RETURN 0
@@ -182,7 +182,7 @@
 // If undefined, contines in the parent instead.
 #define FITM_FORK_FOLLOW_CHILD 1
 // If defined, will _exit(0) for an accept after fuzzing has started.
-//#define FITM_ACCEPT_ONCE 1
+#define FITM_ACCEPT_ONCE 1
 
 // Randomly chosen offsets in the AFL Bitmp, to emphasize sent operations for afl.
 // >> Make sure we don't minimize it.
@@ -3423,7 +3423,7 @@ static void fitm_ensure_initialized(void) {
         timewarp_mode = getenv_from_file("LETS_DO_THE_TIMEWARP_AGAIN");
 
         fitm_replay = getenv("FITM_REPLAY") && *getenv("FITM_REPLAY");
-
+        
         if (count_recvs){
             // Ignore any possible error
             char *init_recv_skip_tmp = getenv_from_file("INIT_RECV_SKIP");
@@ -4054,7 +4054,7 @@ static abi_long do_getpeername(int fd, abi_ulong target_addr,
         addr_pointer->sa_data[4] = 0;
         addr_pointer->sa_data[5] = 42;
 
-        ret = 4;
+        ret = 0;
     } else {
         FDBG("getpeername() called on non-fitm fd\n");
 
