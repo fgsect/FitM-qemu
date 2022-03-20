@@ -1,3 +1,10 @@
+=============================
+QEMU for AFLplusplus for FitM
+=============================
+
+This fork of `qemuafl <https://github.com/AFLplusplus/qemuafl>`_ enables network emulation without sockets and process snapshotting through CRIU RPC.
+It is used by `FitM <https://github.com/fgsect/fitm>`_.
+
 ====================
 QEMU for AFLplusplus
 ====================
