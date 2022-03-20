@@ -4,7 +4,7 @@ QEMU for AFLplusplus for FitM
 
 This fork of `qemuafl <https://github.com/AFLplusplus/qemuafl>`_ enables network emulation without sockets and process snapshotting through CRIU RPC.
 It is used by `FitM <https://github.com/fgsect/fitm>`_.
-Most additions center around CRIU integration and the network emulation layer in [syscall.c](https://github.com/fgsect/FitM-qemu/blob/fitm/linux-user/syscall.c).
+Most additions center around CRIU integration and the network emulation layer in (syscall.c)[https://github.com/fgsect/FitM-qemu/blob/fitm/linux-user/syscall.c].
 
 ====================
 QEMU for AFLplusplus
